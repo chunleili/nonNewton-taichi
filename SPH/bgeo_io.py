@@ -8,7 +8,9 @@ import numpy as np
 
 def read_bhclassic(path):
     """返回 dict：'position' -> (N,3) float32，以及其余点属性（float/int/vector）。"""
-    with (gzip.open if str(path).endswith(".gz") else open)(path, "rb") as f:
+    with open(path, "rb") as probe:
+        compressed = probe.read(2) == b"\x1f\x8b"
+    with (gzip.open if compressed else open)(path, "rb") as f:
         buf = f.read()
     o = 0
 

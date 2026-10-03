@@ -1,0 +1,781 @@
+diff --git a/SPlisHSPlasH/My/Viscosity_Casson/Viscosity_Casson.cpp b/SPlisHSPlasH/My/Viscosity_Casson/Viscosity_Casson.cpp
+index a23f91e..1220615 100644
+--- a/SPlisHSPlasH/My/Viscosity_Casson/Viscosity_Casson.cpp
++++ b/SPlisHSPlasH/My/Viscosity_Casson/Viscosity_Casson.cpp
+@@ -311,7 +311,8 @@ void Viscosity_Casson::diagonalMatrixElement(const unsigned int i, Matrix3r &res
+ 		const Real density_j = model->getDensity(neighborIndex);
+ 		const Vector3r gradW = sim->gradW(xi - xj);
+ 		const Vector3r xixj = xi - xj;
+-		result += d * mu * (model->getMass(neighborIndex) / density_j) / (xixj.squaredNorm() + 0.01*h2) * (gradW * xixj.transpose());
++		// Match the non-Newton coefficient used by matrixVecProd.
++		result += d * mu * visco->m_viscosity_nonNewton[neighborIndex] * (model->getMass(neighborIndex) / density_j) / (xixj.squaredNorm() + 0.01*h2) * (gradW * xixj.transpose());
+ 	);
+ 
+ 	// MYADD: 删掉boundary部分
+@@ -416,6 +417,9 @@ void Viscosity_Casson::diagonalMatrixElement(const unsigned int i, Matrix3r &res
+ #else
+ // MYADD: 删掉非blockdiagonal部分
+ #endif
++	// The matrix is I - dt/rho_i * L, not L. Omitting this identity
++	// makes isolated-particle blocks singular and breaks the CG solve.
++	result = Matrix3r::Identity() - (dt / density_i) * result;
+ }
+ 
+ 
+diff --git a/Simulator/Exporter/ParticleExporter_MyPartio.cpp b/Simulator/Exporter/ParticleExporter_MyPartio.cpp
+index cd0becc..81b646f 100644
+--- a/Simulator/Exporter/ParticleExporter_MyPartio.cpp
++++ b/Simulator/Exporter/ParticleExporter_MyPartio.cpp
+@@ -2,6 +2,9 @@
+ #include <Utilities/Logger.h>
+ #include <Utilities/FileSystem.h>
+ #include "SPlisHSPlasH/Simulation.h"
++#include "SPlisHSPlasH/TimeManager.h"
++#include <fstream>
++#include <iomanip>
+ // #include "extern/partio/src/lib/Partio.h"
+ #include "extern/my_partio/Partio.h"
+ #include "extern/my_partio/PartioSingleton.h"
+@@ -27,6 +30,10 @@ void ParticleExporter_MyPartio::step(const unsigned int frame)
+ {
+ 	if (!m_active)
+ 		return;
++	// Diagnostics only: record actual adaptive-step export times.
++	std::ofstream times(m_exportPath + "/frame_times.csv", frame == 1 ? std::ios::trunc : std::ios::app);
++	if (frame == 1) times << "frame,time\n";
++	times << frame << "," << std::setprecision(12) << TimeManager::getCurrent()->getTime() << "\n";
+ 
+ 	Simulation* sim = Simulation::getCurrent();
+ 	for (unsigned int i = 0; i < sim->numberOfFluidModels(); i++)
+@@ -231,4 +238,4 @@ void ParticleExporter_MyPartio::writeParticlesPartio(const std::string& fileName
+ 		Partio::write(m_particleFile.c_str(), particleData, true);
+ 		particleData.release();
+ 	}
+-}
+\ No newline at end of file
++}
+diff --git a/Simulator/SimulatorBase.cpp b/Simulator/SimulatorBase.cpp
+index 40c0097..03f6d98 100644
+--- a/Simulator/SimulatorBase.cpp
++++ b/Simulator/SimulatorBase.cpp
+@@ -581,6 +581,9 @@ void SimulatorBase::runSimulation()
+             exit(1);
+         }
+ 
++        // Export the unadvanced initial configuration for alignment runs.
++        if (getStateFile().empty() && m_nextFrameTime == 0.0)
++            step();
+         while (true)
+         {
+             if (!timeStepNoGUI())
+diff --git a/data/MyScenes/align_hotcut.json b/data/MyScenes/align_hotcut.json
+new file mode 100644
+index 0000000..a564a78
+--- /dev/null
++++ b/data/MyScenes/align_hotcut.json
+@@ -0,0 +1,127 @@
++{
++  "Configuration": {
++    "particleRadius": 0.025,
++    "numberOfStepsPerRenderUpdate": 4,
++    "density0": 1000,
++    "simulationMethod": 4,
++    "gravitation": [
++      0,
++      -9.81,
++      0
++    ],
++    "timeStepSize": 0.005,
++    "cflMethod": 1,
++    "cflFactor": 1,
++    "cflMaxTimeStepSize": 0.005,
++    "maxIterations": 100,
++    "maxError": 0.05,
++    "maxIterationsV": 100,
++    "maxErrorV": 0.1,
++    "stiffness": 50000,
++    "exponent": 7,
++    "velocityUpdateMethod": 0,
++    "enableDivergenceSolver": true,
++    "boundaryHandlingMethod": 0,
++    "enableZSort": false,
++    "enableMyPartioExport": true,
++    "dataExportFPS": 25,
++    "particleAttributes": "velocity;nonNewtonViscosity;temperature;density",
++    "stopAt": 20,
++    "enableObjectSplitting": false
++  },
++  "Materials": [
++    {
++      "id": "Fluid",
++      "surfaceTensionMethod": 5,
++      "colorField": "temperature",
++      "renderMaxValue": 1.0,
++      "boxMax": [
++        1,
++        0.05,
++        1
++      ],
++      "boxMin": [
++        -1,
++        0.0,
++        -1
++      ],
++      "viscosity0": 20.0,
++      "viscosity": 20.0,
++      "viscosityMethod": 8,
++      "meltSurface": false,
++      "meltbox": true,
++      "diffusivity": 100.0,
++      "hotWaterTemp": 100.0,
++      "viscoMaxIter": 1000
++    }
++  ],
++  "RigidBodies": [
++    {
++      "geometryFile": "../models/hot_cut_bcylinder.obj",
++      "color": [
++        0.1,
++        0.4,
++        0.6,
++        1.0
++      ],
++      "translation": [
++        0,
++        0,
++        0
++      ],
++      "scale": [
++        1.0,
++        1.0,
++        1.0
++      ],
++      "isDynamic": false,
++      "isWall": true,
++      "mapInvert": true,
++      "mapThickness": 0.0,
++      "mapResolution": [
++        10,
++        10,
++        10
++      ]
++    },
++    {
++      "geometryFile": "../models/hot_cut_cross_plane.obj",
++      "color": [
++        0.1,
++        0.4,
++        0.6,
++        1.0
++      ],
++      "translation": [
++        0,
++        0,
++        0
++      ],
++      "scale": [
++        1.0,
++        1.0,
++        1.0
++      ],
++      "isDynamic": false,
++      "isWall": false,
++      "mapInvert": false,
++      "mapThickness": 0.0,
++      "mapResolution": [
++        10,
++        10,
++        10
++      ]
++    }
++  ],
++  "FluidModels": [
++    {
++      "id": "Fluid",
++      "particleFile": "../models/hot_cut_bunny_sampled.bhclassic",
++      "translation": [
++        0,
++        0.1,
++        0
++      ]
++    }
++  ]
++}
+diff --git a/data/MyScenes/align_ice-cream.json b/data/MyScenes/align_ice-cream.json
+new file mode 100644
+index 0000000..a8a2719
+--- /dev/null
++++ b/data/MyScenes/align_ice-cream.json
+@@ -0,0 +1,102 @@
++{
++  "Configuration": {
++    "particleRadius": 0.025,
++    "numberOfStepsPerRenderUpdate": 4,
++    "density0": 1000,
++    "simulationMethod": 4,
++    "gravitation": [
++      0,
++      -9.81,
++      0
++    ],
++    "timeStepSize": 0.005,
++    "cflMethod": 1,
++    "cflFactor": 1,
++    "cflMaxTimeStepSize": 0.005,
++    "maxIterations": 100,
++    "maxError": 0.05,
++    "maxIterationsV": 100,
++    "maxErrorV": 0.1,
++    "stiffness": 50000,
++    "exponent": 7,
++    "velocityUpdateMethod": 0,
++    "enableDivergenceSolver": true,
++    "boundaryHandlingMethod": 0,
++    "enableZSort": false,
++    "enableMyPartioExport": true,
++    "dataExportFPS": 25,
++    "particleAttributes": "velocity;nonNewtonViscosity;temperature;density",
++    "stopAt": 10,
++    "enableObjectSplitting": false
++  },
++  "Materials": [
++    {
++      "id": "Fluid",
++      "surfaceTensionMethod": 5,
++      "colorField": "temperature",
++      "renderMaxValue": 1.0,
++      "boxMax": [
++        1,
++        0.0,
++        1
++      ],
++      "boxMin": [
++        -1,
++        0.0,
++        -1
++      ],
++      "viscosity0": 1000,
++      "viscosity": 1.0,
++      "viscosityMethod": 8,
++      "meltSurface": true,
++      "surfaceTemp": 0.0,
++      "diffusivity": 30.0,
++      "surfaceSource0": 1.0
++    }
++  ],
++  "RigidBodies": [
++    {
++      "id": "glass",
++      "geometryFile": "../models/glass.obj",
++      "translation": [
++        0,
++        -1.5,
++        0
++      ],
++      "rotationAxis": [
++        1,
++        0,
++        0
++      ],
++      "rotationAngle": 0,
++      "scale": [
++        0.3,
++        0.3,
++        0.3
++      ],
++      "color": [
++        0.145,
++        0.588,
++        0.745,
++        1.0
++      ],
++      "isDynamic": false,
++      "isWall": false,
++      "mapInvert": false,
++      "mapThickness": 0.0,
++      "mapResolution": [
++        30,
++        30,
++        30
++      ],
++      "friction": 0.1,
++      "restitution": 0.1,
++      "collisionObjectType": 5
++    }
++  ],
++  "FluidModels": [
++    {
++      "particleFile": "../models/ice-cream.bhclassic"
++    }
++  ]
++}
+diff --git a/data/MyScenes/align_ramp1.json b/data/MyScenes/align_ramp1.json
+new file mode 100644
+index 0000000..f603d55
+--- /dev/null
++++ b/data/MyScenes/align_ramp1.json
+@@ -0,0 +1,155 @@
++{
++  "Configuration": {
++    "timeStepSize": 0.001,
++    "numberOfStepsPerRenderUpdate": 2,
++    "particleRadius": 0.025,
++    "density0": 1000,
++    "simulationMethod": 4,
++    "gravitation": [
++      0,
++      -9.81,
++      0
++    ],
++    "cflMethod": 1,
++    "cflFactor": 1,
++    "cflMaxTimeStepSize": 0.005,
++    "maxIterations": 100,
++    "maxError": 0.1,
++    "maxIterationsV": 100,
++    "maxErrorV": 0.1,
++    "stiffness": 50000,
++    "exponent": 7,
++    "velocityUpdateMethod": 0,
++    "enableDivergenceSolver": true,
++    "boundaryHandlingMethod": 2,
++    "enableMyPartioExport": true,
++    "dataExportFPS": 25,
++    "particleAttributes": "velocity;nonNewtonViscosity;strainRateNorm;density",
++    "stopAt": 5,
++    "enableObjectSplitting": false
++  },
++  "Materials": [
++    {
++      "id": "Newtonain",
++      "colorField": "nonNewtonViscosity",
++      "surfaceTensionMethod": 7,
++      "viscosityMethod": 13,
++      "nonNewtonMethod": 0,
++      "viscoMaxError": 0.001,
++      "viscoMaxIter": 1000,
++      "viscosityBoundary": 0.1,
++      "viscosity0": 10.0
++    },
++    {
++      "id": "PowerLaw1",
++      "colorField": "nonNewtonViscosity",
++      "surfaceTensionMethod": 7,
++      "viscosityMethod": 13,
++      "nonNewtonMethod": 1,
++      "viscoMaxError": 0.001,
++      "viscoMaxIter": 1000,
++      "viscosityBoundary": 0.1,
++      "viscosity0": 10.0,
++      "viscosity_inf": 0.01,
++      "power_index": 0.667,
++      "consistency_index": 4.5
++    },
++    {
++      "id": "PowerLaw2",
++      "colorField": "nonNewtonViscosity",
++      "surfaceTensionMethod": 7,
++      "viscosityMethod": 13,
++      "nonNewtonMethod": 1,
++      "viscoMaxError": 0.001,
++      "viscoMaxIter": 1000,
++      "viscosityBoundary": 0.1,
++      "viscosity0": 10.0,
++      "viscosity_inf": 0.01,
++      "power_index": 1.5,
++      "consistency_index": 1.0
++    }
++  ],
++  "RigidBodies": [
++    {
++      "geometryFile": "../models/ramp.obj",
++      "translation": [
++        -8,
++        0,
++        0
++      ],
++      "rotationAxis": [
++        0,
++        1,
++        0
++      ],
++      "rotationAngle": 0,
++      "scale": [
++        3,
++        1,
++        1
++      ],
++      "color": [
++        0.1,
++        0.4,
++        0.6,
++        1.0
++      ],
++      "isDynamic": false,
++      "isWall": false,
++      "mapInvert": false,
++      "mapThickness": 0.0,
++      "mapResolution": [
++        40,
++        40,
++        40
++      ]
++    }
++  ],
++  "FluidModels": [
++    {
++      "id": "Newtonain",
++      "particleFile": "../models/armadillo.bhclassic",
++      "rotationAxis": [
++        1,
++        0,
++        0
++      ],
++      "rotationAngle": 0,
++      "translation": [
++        0,
++        0,
++        0
++      ]
++    },
++    {
++      "id": "PowerLaw1",
++      "particleFile": "../models/armadillo.bhclassic",
++      "rotationAxis": [
++        1,
++        0,
++        0
++      ],
++      "rotationAngle": 0,
++      "translation": [
++        -5,
++        0,
++        0
++      ]
++    },
++    {
++      "id": "PowerLaw2",
++      "particleFile": "../models/armadillo.bhclassic",
++      "rotationAxis": [
++        1,
++        0,
++        0
++      ],
++      "rotationAngle": 0,
++      "translation": [
++        -10,
++        0,
++        0
++      ]
++    }
++  ]
++}
+diff --git a/data/MyScenes/align_ramp2.json b/data/MyScenes/align_ramp2.json
+new file mode 100644
+index 0000000..4ac81d5
+--- /dev/null
++++ b/data/MyScenes/align_ramp2.json
+@@ -0,0 +1,162 @@
++{
++  "Configuration": {
++    "timeStepSize": 0.001,
++    "numberOfStepsPerRenderUpdate": 2,
++    "particleRadius": 0.025,
++    "density0": 1000,
++    "simulationMethod": 4,
++    "gravitation": [
++      0,
++      -9.81,
++      0
++    ],
++    "cflMethod": 1,
++    "cflFactor": 1,
++    "cflMaxTimeStepSize": 0.005,
++    "maxIterations": 100,
++    "maxError": 0.1,
++    "maxIterationsV": 100,
++    "maxErrorV": 0.1,
++    "stiffness": 50000,
++    "exponent": 7,
++    "velocityUpdateMethod": 0,
++    "enableDivergenceSolver": true,
++    "boundaryHandlingMethod": 2,
++    "enableMyPartioExport": true,
++    "dataExportFPS": 25,
++    "particleAttributes": "velocity;nonNewtonViscosity;strainRateNorm;density",
++    "stopAt": 5,
++    "enableObjectSplitting": false
++  },
++  "Materials": [
++    {
++      "id": "Cross",
++      "colorField": "nonNewtonViscosity",
++      "surfaceTensionMethod": 7,
++      "viscosityMethod": 13,
++      "nonNewtonMethod": 2,
++      "viscoMaxError": 0.001,
++      "viscoMaxIter": 1000,
++      "viscosityBoundary": 0.1,
++      "viscosity0": 10.0,
++      "viscosity_inf": 0.01,
++      "power_index": 0.667,
++      "consistency_index": 1.0
++    },
++    {
++      "id": "Casson",
++      "colorField": "nonNewtonViscosity",
++      "surfaceTensionMethod": 7,
++      "viscosityMethod": 13,
++      "nonNewtonMethod": 3,
++      "viscoMaxError": 0.001,
++      "viscoMaxIter": 1000,
++      "viscosityBoundary": 0.1,
++      "viscosity0": 10.0,
++      "viscosity_inf": 0.01,
++      "power_index": 0.667,
++      "consistency_index": 0.04,
++      "muC": 1.0,
++      "yieldStress": 10.0
++    },
++    {
++      "id": "Carreau",
++      "colorField": "nonNewtonViscosity",
++      "surfaceTensionMethod": 7,
++      "viscosityMethod": 13,
++      "nonNewtonMethod": 4,
++      "viscoMaxError": 0.01,
++      "viscoMaxIter": 1000,
++      "viscosityBoundary": 0.1,
++      "viscosity0": 10.0,
++      "viscosity_inf": 0.01,
++      "power_index": 0.2,
++      "consistency_index": 0.1,
++      "muC": 0.3,
++      "yieldStress": 0.1
++    }
++  ],
++  "RigidBodies": [
++    {
++      "geometryFile": "../models/ramp.obj",
++      "translation": [
++        -8,
++        0,
++        0
++      ],
++      "rotationAxis": [
++        0,
++        1,
++        0
++      ],
++      "rotationAngle": 0,
++      "scale": [
++        3,
++        1,
++        1
++      ],
++      "color": [
++        0.1,
++        0.4,
++        0.6,
++        1.0
++      ],
++      "isDynamic": false,
++      "isWall": false,
++      "mapInvert": false,
++      "mapThickness": 0.0,
++      "mapResolution": [
++        40,
++        40,
++        40
++      ]
++    }
++  ],
++  "FluidModels": [
++    {
++      "id": "Cross",
++      "particleFile": "../models/armadillo.bhclassic",
++      "rotationAxis": [
++        1,
++        0,
++        0
++      ],
++      "rotationAngle": 0,
++      "translation": [
++        0,
++        0,
++        0
++      ]
++    },
++    {
++      "id": "Casson",
++      "particleFile": "../models/armadillo.bhclassic",
++      "rotationAxis": [
++        1,
++        0,
++        0
++      ],
++      "rotationAngle": 0,
++      "translation": [
++        -5,
++        0,
++        0
++      ]
++    },
++    {
++      "id": "Carreau",
++      "particleFile": "../models/armadillo.bhclassic",
++      "rotationAxis": [
++        1,
++        0,
++        0
++      ],
++      "rotationAngle": 0,
++      "translation": [
++        -10,
++        0,
++        0
++      ]
++    }
++  ]
++}
+diff --git a/data/MyScenes/align_ramp3.json b/data/MyScenes/align_ramp3.json
+new file mode 100644
+index 0000000..5d67d42
+--- /dev/null
++++ b/data/MyScenes/align_ramp3.json
+@@ -0,0 +1,135 @@
++{
++  "Configuration": {
++    "timeStepSize": 0.001,
++    "numberOfStepsPerRenderUpdate": 2,
++    "particleRadius": 0.025,
++    "density0": 1000,
++    "simulationMethod": 4,
++    "gravitation": [
++      0,
++      -9.81,
++      0
++    ],
++    "cflMethod": 1,
++    "cflFactor": 1,
++    "cflMaxTimeStepSize": 0.005,
++    "maxIterations": 100,
++    "maxError": 0.1,
++    "maxIterationsV": 100,
++    "maxErrorV": 0.1,
++    "stiffness": 50000,
++    "exponent": 7,
++    "velocityUpdateMethod": 0,
++    "enableDivergenceSolver": true,
++    "boundaryHandlingMethod": 2,
++    "enableMyPartioExport": true,
++    "dataExportFPS": 25,
++    "particleAttributes": "velocity;nonNewtonViscosity;strainRateNorm;density",
++    "stopAt": 5,
++    "enableObjectSplitting": false
++  },
++  "Materials": [
++    {
++      "id": "Bingham",
++      "colorField": "nonNewtonViscosity",
++      "surfaceTensionMethod": 7,
++      "viscosityMethod": 13,
++      "nonNewtonMethod": 5,
++      "viscoMaxError": 0.01,
++      "viscoMaxIter": 1000,
++      "viscosityBoundary": 0.1,
++      "viscosity0": 10.0,
++      "viscosity_inf": 0.01,
++      "power_index": 0.1,
++      "consistency_index": 0.2,
++      "muC": 0.3,
++      "yieldStress": 0.1,
++      "criticalStrainRate": 1.0
++    },
++    {
++      "id": "HerschelBulkley",
++      "colorField": "nonNewtonViscosity",
++      "surfaceTensionMethod": 7,
++      "viscosityMethod": 13,
++      "nonNewtonMethod": 6,
++      "viscoMaxError": 0.01,
++      "viscoMaxIter": 1000,
++      "viscosityBoundary": 0.1,
++      "viscosity0": 10.0,
++      "viscosity_inf": 0.01,
++      "power_index": 0.667,
++      "consistency_index": 10.0,
++      "muC": 0.3,
++      "yieldStress": 0.1,
++      "criticalStrainRate": 10.0
++    }
++  ],
++  "RigidBodies": [
++    {
++      "geometryFile": "../models/ramp.obj",
++      "translation": [
++        -8,
++        0,
++        0
++      ],
++      "rotationAxis": [
++        0,
++        1,
++        0
++      ],
++      "rotationAngle": 0,
++      "scale": [
++        3,
++        1,
++        1
++      ],
++      "color": [
++        0.1,
++        0.4,
++        0.6,
++        1.0
++      ],
++      "isDynamic": false,
++      "isWall": false,
++      "mapInvert": false,
++      "mapThickness": 0.0,
++      "mapResolution": [
++        40,
++        40,
++        40
++      ]
++    }
++  ],
++  "FluidModels": [
++    {
++      "id": "Bingham",
++      "particleFile": "../models/armadillo.bhclassic",
++      "rotationAxis": [
++        1,
++        0,
++        0
++      ],
++      "rotationAngle": 0,
++      "translation": [
++        0,
++        0,
++        0
++      ]
++    },
++    {
++      "id": "HerschelBulkley",
++      "particleFile": "../models/armadillo.bhclassic",
++      "rotationAxis": [
++        1,
++        0,
++        0
++      ],
++      "rotationAngle": 0,
++      "translation": [
++        -5,
++        0,
++        0
++      ]
++    }
++  ]
++}

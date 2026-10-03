@@ -84,6 +84,15 @@ class ConstraintSolver:
         fiber_dir=None,
         fiber_w=None,
         omega_f=0.25,
+        particle_mass=None,
+        rest_density=None,
+        heat_box=None,
+        cpp_offset=(0.0, 0.0, 0.0),
+        boundary_akinci=False,
+        clip_domain=True,
+        viscosity_force_scale=1.0,
+        visc_cg=False,
+        cpp_visc_cg=False,
     ):
         self.d = spacing
         self.h = 2.0 * spacing  # 支撑半径 = 4 倍粒子半径
@@ -97,9 +106,18 @@ class ConstraintSolver:
         self.friction = friction
         self.heat_y = heat_y
         self.heat_R = heat_R
+        self.heat_box = heat_box
+        self.has_heat_box = heat_box is not None
+        self.cpp_offset = ti.Vector(list(cpp_offset))
+        self.boundary_akinci = boundary_akinci
+        self.clip_domain = clip_domain
+        self.viscosity_force_scale = viscosity_force_scale
+        self.visc_cg = visc_cg
+        self.cpp_visc_cg = cpp_visc_cg
         self.diffusion = diffusion
         self.mu_scale = mu_scale  # 黏度模型输出乘子；nonNewtonCode 的黏度为运动黏度，取 rho0 换算为动力黏度
         self.cpp_compat = cpp_compat  # True：复刻 nonNewtonCode 的应变率（仅末邻居）、Carreau 写法、不截断黏度
+        self.max_nb = 128 if cpp_compat else MAX_NB
         self.surf_source = surf_source  # 表面热源（邻居数 < surf_thresh 的粒子），对应论文冰淇淋融化
         self.surf_thresh = surf_thresh
         # None：边界粒子作为位移为 0 的邻居参与黏性约束（无滑移，黏度同流体）
@@ -114,6 +132,10 @@ class ConstraintSolver:
         ksum = rest_kernel_sum or self._lattice_kernel_sum()
         self.mass = 1000.0 * spacing**3 if rest_kernel_sum is None else 1000.0 / ksum
         self.rho0 = self.mass * ksum
+        if particle_mass is not None:
+            self.mass = particle_mass
+        if rest_density is not None:
+            self.rho0 = rest_density
         self.V = self.mass / self.rho0
         self.kappa_inv = density_compliance  # alpha_rho * V，0 即严格不可压
         self.has_elastic = any(mt["E"] > 0 for mt in materials)
@@ -131,9 +153,10 @@ class ConstraintSolver:
         self.origin = -3.0 * spacing
 
         # 粒子状态
-        self.x = ti.Vector.field(3, ti.f32, n)
-        self.x_old = ti.Vector.field(3, ti.f32, n)
-        self.x0 = ti.Vector.field(3, ti.f32, n)
+        position_type = ti.f64 if cpp_compat else ti.f32
+        self.x = ti.Vector.field(3, position_type, n)
+        self.x_old = ti.Vector.field(3, position_type, n)
+        self.x0 = ti.Vector.field(3, position_type, n)
         self.v = ti.Vector.field(3, ti.f32, n)
         self.dx = ti.Vector.field(3, ti.f32, n)
         self.body = ti.field(ti.i32, n)
@@ -141,8 +164,10 @@ class ConstraintSolver:
         self.fext = ti.Vector.field(3, ti.f32, n)  # 逐粒子外加速度（力 / 质量），用于 Neumann / Robin 边界
         self.obj = ti.field(ti.i32, n)  # 弹性参考邻域按 obj 划分，默认同 body；同一物体内可含多种材料
         self.rho = ti.field(ti.f32, n)
+        self.pmass = ti.field(ti.f32, n)
         self.T = ti.field(ti.f32, n)
         self.T_new = ti.field(ti.f32, n)
+        self.surface_source = ti.field(ti.f32, n)
         self.mu = ti.field(ti.f32, n)
         self.sr = ti.field(ti.f32, n)
         self.Vt = ti.field(ti.f32, n)  # 参考体积
@@ -162,24 +187,37 @@ class ConstraintSolver:
         self.activation = ti.field(ti.f32, ())
         self.dlam = ti.field(ti.f32, n)
         # 邻域
-        self.nb = ti.field(ti.i32, (n, MAX_NB))
+        self.nb = ti.field(ti.i32, (n, self.max_nb))
         self.nb_cnt = ti.field(ti.i32, n)
-        self.ref_nb = ti.field(ti.i32, (n, MAX_NB))
+        self.ref_nb = ti.field(ti.i32, (n, self.max_nb))
         self.ref_cnt = ti.field(ti.i32, n)
-        self.g0 = ti.Vector.field(3, ti.f32, (n, MAX_NB))
+        self.g0 = ti.Vector.field(3, ti.f32, (n, self.max_nb))
         self.gdim = [int(math.ceil((L + 6.0 * spacing) / self.h)) + 1 for L in self.domain]
-        self.cell_count = ti.field(ti.i32, self.gdim)
-        self.cell_list = ti.field(ti.i32, self.gdim + [MAX_CELL])
+        self.hash_size = 1 << int(math.ceil(math.log2(max(1024, 4 * n))))
+        cell_shape = [self.hash_size] if cpp_compat else self.gdim
+        self.cell_count = ti.field(ti.i32, cell_shape)
+        self.cell_list = ti.field(ti.i32, cell_shape + [MAX_CELL])
         # 材料表
         self.b_model = ti.field(ti.i32, MAX_BODY)
         self.b_elastic = ti.field(ti.i32, MAX_BODY)
         self.b_par = ti.field(ti.f32, (MAX_BODY, 16))
         # 诊断
         self.stat = ti.field(ti.f32, 4)
+        self.cg_x = ti.Vector.field(3, ti.f32, n)
+        self.cg_r = ti.Vector.field(3, ti.f32, n)
+        self.cg_p = ti.Vector.field(3, ti.f32, n)
+        self.cg_Ap = ti.Vector.field(3, ti.f32, n)
+        self.cg_D = ti.Matrix.field(3, 3, ti.f32, n)
+        self.cg_diag = ti.field(ti.f32, n)
+        self.cg_rhs = ti.Vector.field(3, ti.f32, n)
+        self.cg_scale = ti.field(ti.f32, n)
+        self.cg_Minv = ti.Matrix.field(3, 3, ti.f32, n)
+        self.cg_state = ti.field(ti.f64, 8)
 
-        self.x.from_numpy(pos.astype(np.float32))
-        self.x0.from_numpy(pos.astype(np.float32))
-        self.x_old.from_numpy(pos.astype(np.float32))  # 边界粒子的 x_old 必须等于其位置，否则黏性约束会看到虚假位移
+        position_dtype = np.float64 if cpp_compat else np.float32
+        self.x.from_numpy(pos.astype(position_dtype))
+        self.x0.from_numpy(pos.astype(position_dtype))
+        self.x_old.from_numpy(pos.astype(position_dtype))
         self.body.from_numpy(body.astype(np.int32))
         pin = np.zeros(n, np.int32)
         if pinned is not None:
@@ -196,6 +234,7 @@ class ConstraintSolver:
         self._load_materials(materials)
         self._init_state()
         self.build_grid(self.x)
+        self.init_boundary_mass()
         self.find_neighbors(self.x)
         self.init_reference()
 
@@ -293,6 +332,24 @@ class ConstraintSolver:
         return A - A.trace() / 3.0 * ti.Matrix.identity(ti.f32, 3)
 
     # ------------------------------------------------------------------ neighbor search
+    @ti.kernel
+    def init_boundary_mass(self):
+        for i in range(self.n):
+            self.pmass[i] = self.mass
+            if ti.static(self.boundary_akinci):
+                if i >= self.nf:
+                    c = self.cell_of(self.x[i])
+                    delta = self.W(0.0)
+                    for off in ti.static(ti.grouped(ti.ndrange((-1, 2), (-1, 2), (-1, 2)))):
+                        cc = c + off
+                        if self.in_grid(cc):
+                            ci = self.cell_index(cc)
+                            for k in range(ti.min(self.cell_count[ci], MAX_CELL)):
+                                j = self.cell_list[ci, k]
+                                if j >= self.nf and j != i and (self.cell_of(self.x[j]) == cc).all():
+                                    delta += self.W((self.x[i] - self.x[j]).norm())
+                    self.pmass[i] = self.rho0 / delta
+
     @ti.func
     def cell_of(self, p):
         q = (p - self.origin) / self.h
@@ -300,7 +357,17 @@ class ConstraintSolver:
 
     @ti.func
     def in_grid(self, c):
-        return 0 <= c[0] < self.gdim[0] and 0 <= c[1] < self.gdim[1] and 0 <= c[2] < self.gdim[2]
+        valid = True
+        if ti.static(not self.cpp_compat):
+            valid = 0 <= c[0] < self.gdim[0] and 0 <= c[1] < self.gdim[1] and 0 <= c[2] < self.gdim[2]
+        return valid
+
+    @ti.func
+    def cell_index(self, c):
+        if ti.static(self.cpp_compat):
+            return ((c[0] * 73856093) ^ (c[1] * 19349663) ^ (c[2] * 83492791)) & (self.hash_size - 1)
+        else:
+            return c
 
     @ti.kernel
     def build_grid(self, xs: ti.template()):
@@ -308,9 +375,11 @@ class ConstraintSolver:
             self.cell_count[I] = 0
         for i in range(self.n):
             c = self.cell_of(xs[i])
-            k = ti.atomic_add(self.cell_count[c], 1)
-            if k < MAX_CELL:
-                self.cell_list[c, k] = i
+            if self.in_grid(c):
+                ci = self.cell_index(c)
+                k = ti.atomic_add(self.cell_count[ci], 1)
+                if k < MAX_CELL:
+                    self.cell_list[ci, k] = i
 
     @ti.kernel
     def find_neighbors(self, xs: ti.template()):
@@ -320,9 +389,10 @@ class ConstraintSolver:
             for off in ti.static(ti.grouped(ti.ndrange((-1, 2), (-1, 2), (-1, 2)))):
                 cc = c + off
                 if self.in_grid(cc):
-                    for k in range(ti.min(self.cell_count[cc], MAX_CELL)):
-                        j = self.cell_list[cc, k]
-                        if j != i and (xs[i] - xs[j]).norm() < self.h and cnt < MAX_NB:
+                    ci = self.cell_index(cc)
+                    for k in range(ti.min(self.cell_count[ci], MAX_CELL)):
+                        j = self.cell_list[ci, k]
+                        if j != i and (self.cell_of(xs[j]) == cc).all() and (xs[i] - xs[j]).norm() < self.h and cnt < self.max_nb:
                             self.nb[i, cnt] = j
                             cnt += 1
             self.nb_cnt[i] = cnt
@@ -387,7 +457,7 @@ class ConstraintSolver:
             rho = self.mass * self.W(0.0)
             for jj in range(self.nb_cnt[i]):
                 j = self.nb[i, jj]
-                rho += self.mass * self.W((xs[i] - xs[j]).norm())
+                rho += self.pmass[j] * self.W((xs[i] - xs[j]).norm())
             self.rho[i] = rho
 
     @ti.kernel
@@ -405,7 +475,7 @@ class ConstraintSolver:
                 last = ti.Matrix.zero(ti.f32, 3, 3)
                 for jj in range(self.nb_cnt[i]):
                     j = self.nb[i, jj]
-                    if j < self.nf:
+                    if j < self.nf and self.body[j] == self.body[i]:
                         gl = (self.v[j] - self.v[i]).outer_product(self.gradW(self.x[i] - self.x[j]))
                         last = self.mass * (gl + gl.transpose())
                 sr = (0.5 / self.rho[i] * last).norm()
@@ -438,7 +508,7 @@ class ConstraintSolver:
         s2 = 0.0
         for jj in range(self.nb_cnt[i]):
             j = self.nb[i, jj]
-            g = self.mass / self.rho0 * self.gradW(xs[i] - xs[j])
+            g = self.pmass[j] / self.rho0 * self.gradW(xs[i] - xs[j])
             gi += g
             if j < self.nf:
                 s2 += g.norm_sqr() / self.mass
@@ -451,7 +521,7 @@ class ConstraintSolver:
             rho = self.mass * self.W(0.0)
             for jj in range(self.nb_cnt[i]):
                 j = self.nb[i, jj]
-                rho += self.mass * self.W((self.x[i] - self.x[j]).norm())
+                rho += self.pmass[j] * self.W((self.x[i] - self.x[j]).norm())
             self.rho[i] = rho
             C = rho / self.rho0 - 1.0
             A = self.density_diag(i, self.x) + a_t
@@ -466,7 +536,7 @@ class ConstraintSolver:
             d = ti.Vector([0.0, 0.0, 0.0])
             for jj in range(self.nb_cnt[i]):
                 j = self.nb[i, jj]
-                d += (self.dlam[i] + self.dlam[j]) * self.gradW(xs[i] - xs[j])
+                d += (self.pmass[j] / self.mass) * (self.dlam[i] + self.dlam[j]) * self.gradW(xs[i] - xs[j])
             out[i] = d / self.rho0  # 等质量：w_i m_j = 1
 
     # ---- 无散约束（速度层）
@@ -477,7 +547,7 @@ class ConstraintSolver:
             cd = 0.0
             for jj in range(self.nb_cnt[i]):
                 j = self.nb[i, jj]
-                cd += self.mass / self.rho0 * (self.v[i] - self.v[j]).dot(self.gradW(self.x[i] - self.x[j]))
+                cd += self.pmass[j] / self.rho0 * (self.v[i] - self.v[j]).dot(self.gradW(self.x[i] - self.x[j]))
             A = self.density_diag(i, self.x) + a_t
             dl = (-cd - a_t * self.lam_div[i]) / (A + 1e-12)
             lnew = ti.min(self.lam_div[i] + dl, 0.0)
@@ -490,6 +560,170 @@ class ConstraintSolver:
             self.v[i] += self.omega * self.dx[i]
 
     # ---- 黏性约束
+    @ti.kernel
+    def viscosity_operator(self, src: ti.template(), out: ti.template()):
+        # A = I + B^T diag(2 mu V dt / mass) B, B = dev(sym(grad)).
+        # This is the same quadratic strain energy underlying the XPBD viscosity.
+        for i in range(self.nf):
+            G = ti.Matrix.zero(ti.f32, 3, 3)
+            for jj in range(self.nb_cnt[i]):
+                j = self.nb[i, jj]
+                if j < self.nf and self.body[j] == self.body[i]:
+                    G += self.V * (src[j] - src[i]).outer_product(self.gradW(self.x[i] - self.x[j]))
+            self.cg_D[i] = self.mu[i] * self.viscosity_force_scale * self.dev(0.5 * (G + G.transpose()))
+        for i in range(self.nf):
+            force = ti.Vector([0.0, 0.0, 0.0])
+            for jj in range(self.nb_cnt[i]):
+                j = self.nb[i, jj]
+                if j < self.nf and self.body[j] == self.body[i]:
+                    force -= self.V * ((self.cg_D[i] + self.cg_D[j]) @ self.gradW(self.x[i] - self.x[j]))
+            out[i] = src[i] + 2.0 * self.V * self.dt / self.mass * force
+
+    @ti.kernel
+    def cpp_viscosity_operator(self, src: ti.template(), out: ti.template()):
+        # Casson.cpp uses mu_j, producing a diagonally symmetrizable matrix.
+        # q_i=sqrt(mu_i)*v_i makes the reference operator symmetric positive definite.
+        for i in range(self.nf):
+            value = src[i]
+            mui = self.cg_scale[i]**2
+            for jj in range(self.nb_cnt[i]):
+                j = self.nb[i, jj]
+                if j < self.nf and self.body[j] == self.body[i]:
+                    r = (self.x[i] - self.x[j]).cast(ti.f32)
+                    muj = self.cg_scale[j]**2
+                    dv = src[i] / self.cg_scale[i] - src[j] / self.cg_scale[j]
+                    value -= 10.0 * self.dt * self.mass * muj * self.cg_scale[i] / (self.rho[i] * self.rho[j]) * dv.dot(r) / (r.norm_sqr() + 0.01 * self.h**2) * self.gradW(r)
+            out[i] = value
+
+    @ti.kernel
+    def viscosity_cg_init(self):
+        for i in range(self.nf):
+            self.cg_scale[i] = 1.0
+            if ti.static(self.cpp_visc_cg):
+                self.cg_scale[i] = ti.sqrt(ti.max(self.mu[i] * self.viscosity_force_scale, 1e-8))
+            self.cg_rhs[i] = self.cg_scale[i] * self.v[i]
+            self.cg_x[i] = self.cg_rhs[i]
+            gsum = ti.Vector([0.0, 0.0, 0.0])
+            diag = ti.Matrix.zero(ti.f32, 3, 3)
+            for jj in range(self.nb_cnt[i]):
+                j = self.nb[i, jj]
+                if j < self.nf and self.body[j] == self.body[i]:
+                    g = self.gradW(self.x[i] - self.x[j])
+                    gsum += g
+                    diag += self.mu[j] * g.outer_product(g)
+            diag += self.mu[i] * gsum.outer_product(gsum)
+            # Positive scalar bound for the three-component diagonal block.
+            self.cg_diag[i] = 1.0 + 2.0 * self.V**3 * self.dt / self.mass * self.viscosity_force_scale * diag.trace()
+            self.cg_Minv[i] = ti.Matrix.identity(ti.f32, 3) / self.cg_diag[i]
+            if ti.static(self.cpp_visc_cg):
+                block = ti.Matrix.identity(ti.f32, 3)
+                for jj in range(self.nb_cnt[i]):
+                    j = self.nb[i, jj]
+                    if j < self.nf and self.body[j] == self.body[i]:
+                        r = (self.x[i] - self.x[j]).cast(ti.f32)
+                        block -= 10.0 * self.dt * self.mass * ti.max(self.mu[j] * self.viscosity_force_scale, 1e-8) / (self.rho[i] * self.rho[j]) * self.gradW(r).outer_product(r) / (r.norm_sqr() + 0.01 * self.h**2)
+                self.cg_Minv[i] = block.inverse()
+
+    @ti.kernel
+    def viscosity_cg_residual(self):
+        for i in range(self.nf):
+            self.cg_r[i] = self.cg_rhs[i] - self.cg_Ap[i]
+            self.cg_p[i] = self.cg_Minv[i] @ self.cg_r[i]
+
+    @ti.kernel
+    def cg_dot(self, a: ti.template(), b: ti.template()) -> ti.f64:
+        value = ti.cast(0.0, ti.f64)
+        for i in range(self.nf):
+            value += ti.cast(a[i].dot(b[i]), ti.f64)
+        return value
+
+    @ti.kernel
+    def cg_preconditioned_norm(self) -> ti.f64:
+        value = ti.cast(0.0, ti.f64)
+        for i in range(self.nf):
+            value += ti.cast(self.cg_r[i].dot(self.cg_Minv[i] @ self.cg_r[i]), ti.f64)
+        return value
+
+    @ti.kernel
+    def viscosity_cg_update(self, alpha: ti.f32):
+        for i in range(self.nf):
+            self.cg_x[i] += alpha * self.cg_p[i]
+            self.cg_r[i] -= alpha * self.cg_Ap[i]
+
+    @ti.kernel
+    def viscosity_cg_direction(self, beta: ti.f32):
+        for i in range(self.nf):
+            self.cg_p[i] = self.cg_Minv[i] @ self.cg_r[i] + beta * self.cg_p[i]
+
+    @ti.kernel
+    def viscosity_cg_finish(self):
+        for i in range(self.nf):
+            self.v[i] = self.cg_x[i] / self.cg_scale[i]
+
+    @ti.kernel
+    def cg_prepare_batch(self):
+        for i in range(self.nf):
+            if self.cg_state[5] > 0:
+                self.cg_p[i] = self.cg_Minv[i] @ self.cg_r[i] + ti.cast(self.cg_state[1], ti.f32) * self.cg_p[i]
+
+    @ti.kernel
+    def cg_dot_batch(self):
+        self.cg_state[2] = 0.0
+        for i in range(self.nf):
+            self.cg_state[2] += ti.cast(self.cg_p[i].dot(self.cg_Ap[i]), ti.f64)
+
+    @ti.kernel
+    def cg_update_batch(self):
+        alpha = ti.cast(0.0, ti.f32)
+        if self.cg_state[5] > 0:
+            if self.cg_state[2] > 0:
+                alpha = ti.cast(self.cg_state[0] / self.cg_state[2], ti.f32)
+                self.cg_state[6] += 1.0
+            else:
+                self.cg_state[7] = 1.0
+                self.cg_state[5] = 0.0
+        for i in range(self.nf):
+            self.cg_x[i] += alpha * self.cg_p[i]
+            self.cg_r[i] -= alpha * self.cg_Ap[i]
+        self.cg_state[2] = 0.0
+        self.cg_state[3] = 0.0
+        for i in range(self.nf):
+            self.cg_state[2] += ti.cast(self.cg_r[i].dot(self.cg_Minv[i] @ self.cg_r[i]), ti.f64)
+            self.cg_state[3] += ti.cast(self.cg_r[i].norm_sqr(), ti.f64)
+        self.cg_state[1] = self.cg_state[2] / ti.max(self.cg_state[0], 1e-30)
+        self.cg_state[0] = self.cg_state[2]
+        if self.cg_state[3] <= self.cg_state[4]:
+            self.cg_state[5] = 0.0
+
+    def solve_viscosity_cg(self, tol=None, max_iters=None):
+        tol = tol if tol is not None else (1e-2 if self.cpp_visc_cg else 1e-3)
+        max_iters = max_iters if max_iters is not None else (1000 if self.cpp_visc_cg else 300)
+        self.viscosity_cg_init()
+        operator = self.cpp_viscosity_operator if self.cpp_visc_cg else self.viscosity_operator
+        operator(self.cg_x, self.cg_Ap)
+        self.viscosity_cg_residual()
+        rz = float(self.cg_preconditioned_norm())
+        rhs2 = float(self.cg_dot(self.cg_rhs, self.cg_rhs))
+        r2 = float(self.cg_dot(self.cg_r, self.cg_r))
+        threshold = tol**2 * max(rhs2, 1e-20)
+        state = np.array([rz, 0, 0, r2, threshold, float(r2 > threshold), 0, 0], np.float64)
+        self.cg_state.from_numpy(state)
+        # Keep scalar recurrences on-device; synchronize once per ten iterations.
+        for first in range(0, max_iters, 10):
+            if state[5] == 0:
+                break
+            for _ in range(min(10, max_iters - first)):
+                self.cg_prepare_batch()
+                operator(self.cg_p, self.cg_Ap)
+                self.cg_dot_batch()
+                self.cg_update_batch()
+            state = self.cg_state.to_numpy()
+            if not np.isfinite(state).all() or state[7] != 0:
+                raise FloatingPointError("Viscosity CG lost positive definiteness or became non-finite")
+        self.viscosity_cg_finish()
+        self.cg_iterations = int(state[6])
+        self.cg_error = math.sqrt(float(state[3]) / max(rhs2, 1e-20))
+
     @ti.kernel
     def viscous_k1(self):
         for i in range(self.nf):
@@ -520,7 +754,7 @@ class ConstraintSolver:
                     if j < self.nf:
                         s2 += a.norm_sqr()
                 A = (gi.norm_sqr() + s2) / self.mass
-                a_t = 1.0 / (2.0 * self.mu[i] * self.V * self.dt)
+                a_t = 1.0 / (2.0 * self.mu[i] * self.viscosity_force_scale * self.V * self.dt)
                 dl = (-C - a_t * self.lam_vis[i]) / (A + a_t)
                 self.lam_vis[i] += dl
                 self.dlam[i] = dl
@@ -653,13 +887,14 @@ class ConstraintSolver:
     def boundary_pos(self):
         for i in range(self.nf):
             p = self.x[i]
-            for a in ti.static(range(3)):
-                lo = self.pad
-                hi = self.domain[a] - self.pad
-                p[a] = ti.min(ti.max(p[a], lo), hi)
-            if p[1] <= self.pad + 1e-7:  # 地面摩擦
-                p[0] = self.x_old[i][0] + (1.0 - self.friction) * (p[0] - self.x_old[i][0])
-                p[2] = self.x_old[i][2] + (1.0 - self.friction) * (p[2] - self.x_old[i][2])
+            if ti.static(self.clip_domain):
+                for a in ti.static(range(3)):
+                    lo = self.pad
+                    hi = self.domain[a] - self.pad
+                    p[a] = ti.min(ti.max(p[a], lo), hi)
+                if p[1] <= self.pad + 1e-7:
+                    p[0] = self.x_old[i][0] + (1.0 - self.friction) * (p[0] - self.x_old[i][0])
+                    p[2] = self.x_old[i][2] + (1.0 - self.friction) * (p[2] - self.x_old[i][2])
             if self.pin[i] == 1:
                 p = self.x0[i]
             self.x[i] = p
@@ -685,7 +920,11 @@ class ConstraintSolver:
                 j = self.nb[i, jj]
                 if j >= self.nf:
                     xij = self.x[i] - self.x[j]
-                    a += 10.0 * nu * (self.mass / self.rho[i]) * self.v[i].dot(xij) / (xij.norm_sqr() + 0.01 * h2) * self.gradW(xij)
+                    # C++ matrixVecProd includes both mub=nu*rho0 and the outer 1/rho_i.
+                    weight = self.mass / self.rho[i]
+                    if ti.static(self.cpp_compat):
+                        weight = self.rho0 * self.pmass[j] / (self.rho[i] * self.rho[i])
+                    a += 10.0 * nu * weight * self.v[i].dot(xij) / (xij.norm_sqr() + 0.01 * h2) * self.gradW(xij)
             self.dx[i] = a
         for i in range(self.nf):
             self.v[i] += self.dt * self.dx[i]
@@ -693,11 +932,12 @@ class ConstraintSolver:
     @ti.kernel
     def boundary_vel(self):
         for i in range(self.nf):
-            for a in ti.static(range(3)):
-                if self.x[i][a] <= self.pad + 1e-7 and self.v[i][a] < 0:
-                    self.v[i][a] = 0.0
-                if self.x[i][a] >= self.domain[a] - self.pad - 1e-7 and self.v[i][a] > 0:
-                    self.v[i][a] = 0.0
+            if ti.static(self.clip_domain):
+                for a in ti.static(range(3)):
+                    if self.x[i][a] <= self.pad + 1e-7 and self.v[i][a] < 0:
+                        self.v[i][a] = 0.0
+                    if self.x[i][a] >= self.domain[a] - self.pad - 1e-7 and self.v[i][a] > 0:
+                        self.v[i][a] = 0.0
             if self.pin[i] == 1:
                 self.v[i] = ti.Vector([0.0, 0.0, 0.0])
 
@@ -712,14 +952,27 @@ class ConstraintSolver:
                     continue
                 lap += self.mass / (self.rho[j] * self.rho[i]) * (self.T[j] - self.T[i]) * self.gradW(self.x[i] - self.x[j]).norm()
             src = 0.0
-            if self.x[i][1] < self.heat_y:
-                src = self.heat_R
+            if ti.static(self.has_heat_box):
+                p = self.x[i] - self.cpp_offset
+                inside = True
+                for a in ti.static(range(3)):
+                    inside = inside and self.heat_box[0][a] < p[a] < self.heat_box[1][a]
+                if inside:
+                    src = self.heat_R
+            else:
+                if self.x[i][1] < self.heat_y:
+                    src = self.heat_R
             nf_cnt = 0
             for jj in range(self.nb_cnt[i]):
                 if self.nb[i, jj] < self.nf:
                     nf_cnt += 1
             if nf_cnt < self.surf_thresh:
-                src += self.surf_source
+                self.surface_source[i] = self.surf_source
+            if ti.static(self.cpp_compat):
+                src += self.surface_source[i]  # C++ retains the source after a surface particle moves inward.
+            else:
+                if nf_cnt < self.surf_thresh:
+                    src += self.surf_source
             if ti.static(self.cpp_compat):
                 src *= nf_cnt  # nonNewtonCode Coagulation：源项写在邻居循环内，被累加 nf_cnt 次
             self.T_new[i] = self.T[i] + self.dt * (self.diffusion * lap + src)
@@ -737,6 +990,21 @@ class ConstraintSolver:
             ti.atomic_max(mx, e)
         return ti.Vector([s / self.n, mx])
 
+    @ti.kernel
+    def neighbor_diagnostics(self) -> ti.types.vector(3, ti.i32):
+        cell_overflow = 0
+        capped = 0
+        outside = 0
+        for I in ti.grouped(self.cell_count):
+            if self.cell_count[I] > MAX_CELL:
+                cell_overflow += 1
+        for i in range(self.nf):
+            if self.nb_cnt[i] == self.max_nb:
+                capped += 1
+            if not self.in_grid(self.cell_of(self.x[i])):
+                outside += 1
+        return ti.Vector([cell_overflow, capped, outside])
+
     # ------------------------------------------------------------------ main step
     def step(self):
         # 1. 步初：邻域、应变率、黏度（柔度）
@@ -744,6 +1012,8 @@ class ConstraintSolver:
         self.find_neighbors(self.x)
         self.compute_density(self.x)
         self.compute_strain_rate_and_mu()
+        if self.visc_cg:
+            self.solve_viscosity_cg()
         # 2. 预测
         self.predict()
         self.boundary_pos()
@@ -756,9 +1026,10 @@ class ConstraintSolver:
             self.density_k1()
             self.density_k2(self.x, self.dx)
             self.apply_dx(self.omega)
-            self.viscous_k1()
-            self.viscous_k2()
-            self.apply_dx(self.omega_s)
+            if not self.visc_cg:
+                self.viscous_k1()
+                self.viscous_k2()
+                self.apply_dx(self.omega_s)
             if self.has_elastic:
                 self.compute_rotation()
                 for mode in (0, 1, 2) if self.has_fiber else (0, 1):
@@ -784,7 +1055,21 @@ class ConstraintSolver:
             self.plasticity()
         if self.has_heat:
             self.diffuse()
+            if self.cpp_compat:
+                self.thermal_compat_state()
         return err_pred, err_post
+
+    @ti.kernel
+    def thermal_compat_state(self):
+        for i in range(self.nf):
+            if self.x[i][1] - self.cpp_offset[1] < 0.01:
+                self.v[i][0] *= 0.1
+                self.v[i][2] *= 0.1
+            vn = self.v[i].norm()
+            if vn > 4.0:
+                self.v[i] *= 4.0 / vn
+            b = self.body[i]
+            self.mu[i] = self.mu_scale * self.viscosity(b, self.sr[i]) * ti.exp(-self.b_par[b, 11] * self.T[i])
 
 
 # ====================================================================== scenes
@@ -930,8 +1215,9 @@ def scene_ramp(args):
     y_floor = (c + s2.max() * t2)[1]
     zs = np.arange((c + s2.max() * t2)[2] - 1.0, (c + s2.max() * t2)[2] + 4.0, d)
     FU, FZ = np.meshgrid(u, zs, indexing="ij")
-    for l in range(2):
-        bnd.append(np.stack([FU.ravel(), np.full(FU.size, y_floor - (0.5 + l) * d), FZ.ravel()], 1))
+    if not args.cpp_compat:
+        for l in range(2):
+            bnd.append(np.stack([FU.ravel(), np.full(FU.size, y_floor - (0.5 + l) * d), FZ.ravel()], 1))
     bnd = np.concatenate(bnd)
     allp = np.concatenate([pos, bnd])
     lo = allp.min(0)
@@ -943,7 +1229,7 @@ def scene_ramp(args):
     return dict(pos=pos + off, body=body, mats=mats, names=names, d=d, domain=dom.tolist(), dt=dt,
                 steps=args.steps or int(round(5.0 / dt)), axis=2, view=(2, 1),
                 cpp_offset=off, meshes=[("ramp", V, F)],
-                solver_kw=dict(box_walls=False, boundary=bnd + off, mu_scale=1000.0,
+                solver_kw=dict(box_walls=False, boundary=bnd + off, clip_domain=not args.cpp_compat, mu_scale=1000.0,
                                visc_boundary=None if args.noslip else 0.1))
 
 
@@ -986,17 +1272,32 @@ def min_dist(src, query, r):
     return out
 
 
+def cpp_boundary_points(args, mesh, scale):
+    from pathlib import Path
+    from bgeo_io import read_bhclassic
+
+    default = Path(__file__).resolve().parents[2] / "nonNewtonCode/data/MyScenes/Cache"
+    cache = Path(args.cpp_boundary_cache) if args.cpp_boundary_cache else default
+    path = cache / f"{mesh}_sb_0.025_{scale}_m0.bgeo"
+    if not path.exists():
+        raise FileNotFoundError(f"C++ boundary cache missing: {path}. Run the C++ scene first, or set --cpp_boundary_cache.")
+    return read_bhclassic(path)["position"].astype(np.float64)
+
+
 def scene_icecream(args):
     # 复刻 nonNewtonCode ice-cream.json：ice-cream.bhclassic（间距 0.07），glass.obj（scale 0.3，平移 y-1.5）
     # 论文 Table 3：mu_i = mu0 exp(-d T)，mu0=1000, D=30, R=1（仅表面，邻居数<10）, d=0.1
     from bgeo_io import read_bhclassic
 
-    d = 0.07
+    d = 0.05 if args.cpp_compat else 0.07
     pos = read_bhclassic(os.path.join(CPP_MODELS, "ice-cream.bhclassic"))["position"].astype(np.float64)
     V, F = load_obj(os.path.join(CPP_MODELS, "glass.obj"))
     V = V * 0.3 + np.array([0.0, -1.5, 0.0])
-    bnd = sample_mesh(V, F, d)
-    bnd = bnd[min_dist(pos, bnd, d) > 0.6 * d]
+    if args.cpp_compat:
+        bnd = cpp_boundary_points(args, "glass", "0.3_0.3_0.3") + np.array([0.0, -1.5, 0.0])
+    else:
+        bnd = sample_mesh(V, F, d)
+        bnd = bnd[min_dist(pos, bnd, d) > 0.6 * d]
     allp = np.concatenate([pos, bnd])
     off = -allp.min(0) + 3.0 * d
     dom = allp.max(0) + off + 3.0 * d
@@ -1006,9 +1307,9 @@ def scene_icecream(args):
     return dict(pos=pos + off, body=np.zeros(len(pos), np.int32), mats=mats, names=["ice-cream"], d=d,
                 domain=dom.tolist(), dt=dt, steps=args.steps or int(round(10.0 / dt)), heat=True, omega_s=0.2,
                 cpp_offset=off, meshes=[("glass", V, F)],
-                solver_kw=dict(box_walls=False, boundary=bnd + off, mu_scale=1000.0, visc_boundary=0.0,
+                solver_kw=dict(box_walls=False, boundary=bnd + off, clip_domain=not args.cpp_compat, boundary_akinci=args.cpp_compat, mu_scale=1000.0, visc_boundary=0.0,
                                heat_y=-1.0, heat_R=0.0, diffusion=30.0, surf_source=1.0,
-                               surf_thresh=15))  # C++ 中 h=0.1 时阈值 10 选出约 6% 表面粒子；本求解器 h=0.14，15 选出同等比例
+                               surf_thresh=10 if args.cpp_compat else 15))
 
 
 def scene_hotcut(args):
@@ -1018,14 +1319,15 @@ def scene_hotcut(args):
 
     pos = read_bhclassic(os.path.join(CPP_MODELS, "hot_cut_bunny_sampled.bhclassic"))["position"].astype(np.float64)
     pos += np.array([0.0, 0.1, 0.0])
-    d = 0.06
+    d = 0.05 if args.cpp_compat else 0.06
     bnd, meshes = [], []
     for name in ("hot_cut_cross_plane", "hot_cut_bcylinder"):
         V, F = load_obj(os.path.join(CPP_MODELS, name + ".obj"))
-        bnd.append(sample_mesh(V, F, d))
+        bnd.append(cpp_boundary_points(args, name, "1_1_1") if args.cpp_compat else sample_mesh(V, F, d))
         meshes.append((name, V, F))
     bnd = np.concatenate(bnd)
-    pos = pos[min_dist(bnd, pos, d) > 0.75 * d]  # 去掉与切割板重叠的粒子（C++ 中由边界压力推开）
+    if not args.cpp_compat:
+        pos = pos[min_dist(bnd, pos, d) > 0.75 * d]
     allp = np.concatenate([pos, bnd])
     off = -allp.min(0) + 3.0 * d
     dom = allp.max(0) + off + 3.0 * d
@@ -1035,8 +1337,10 @@ def scene_hotcut(args):
     return dict(pos=pos + off, body=np.zeros(len(pos), np.int32), mats=mats, names=["bunny"], d=d,
                 domain=dom.tolist(), dt=dt, steps=args.steps or int(round(20.0 / dt)), heat=True,
                 cpp_offset=off, meshes=meshes,
-                solver_kw=dict(box_walls=True, boundary=bnd + off, mu_scale=1000.0, visc_boundary=0.0,
-                               heat_y=hb_y, heat_R=1.0, diffusion=100.0))
+                solver_kw=dict(box_walls=not args.cpp_compat, boundary=bnd + off, clip_domain=not args.cpp_compat, boundary_akinci=args.cpp_compat, mu_scale=1000.0, visc_boundary=0.0,
+                               viscosity_force_scale=20.0 if args.cpp_compat else 1.0,
+                               heat_y=hb_y, heat_R=0.1 if args.cpp_compat else 1.0, diffusion=100.0,
+                               **(dict(heat_box=((-1.0, 0.0, -1.0), (1.0, 0.05, 1.0))) if args.cpp_compat else {})))
 
 
 def load_obj(path):
@@ -1279,11 +1583,15 @@ def main():
     ap.add_argument("--snap_every", type=int, default=0)
     ap.add_argument("--mu_sweep", action="store_true")
     ap.add_argument("--omega_s", type=float, default=0.0, help="黏性/弹性约束 Jacobi 松弛，0 表示用场景默认（0.5）")
+    ap.add_argument("--omega_rho", type=float, default=0.0, help="Density/divergence relaxation; compatibility default 0.5")
+    ap.add_argument("--visc_cg", action="store_true", help="Solve the quadratic viscous strain energy globally by matrix-free CG")
+    ap.add_argument("--cpp_visc_cg", action="store_true", help="Use the C++ Casson fluid viscosity discretization and symmetrized CG")
     ap.add_argument("--group", default="ramp1", choices=list(RAMP_GROUPS), help="ramp 场景：对应 nonNewtonCode 的 ramp1/2/3.json")
     ap.add_argument("--coarsen", type=int, default=1, help="ramp 场景：粒子点阵粗化倍数，2 即间距 0.1、粒子数 1/8")
     ap.add_argument("--dt", type=float, default=0.0, help="覆盖场景默认时间步")
     ap.add_argument("--noslip", action="store_true", help="ramp 场景：斜面参与黏性约束（无滑移），默认用 C++ 的 Akinci 边界黏性 0.1")
     ap.add_argument("--cpp_compat", action="store_true", help="复刻 nonNewtonCode 的应变率（仅末邻居）与 Carreau 写法，且不截断黏度")
+    ap.add_argument("--cpp_boundary_cache", default="", help="C++ data/MyScenes/Cache directory for matching thermal-scene boundary samples")
     ap.add_argument("--export", default="none", choices=["none", "usd"],
                     help="导出 usdc 序列；含边界网格与边界粒子，C++ 场景（ramp/icecream/hotcut）坐标与 nonNewtonCode 一致")
     ap.add_argument("--fps", type=float, default=30.0, help="导出帧率，每 round(1/(fps*dt)) 步导出一帧")
@@ -1302,9 +1610,18 @@ def main():
     ap.add_argument("--act_ramp", type=float, default=0.2, help="bicep 场景：激活升降时长（s）")
     ap.add_argument("--act_hold", type=float, default=0.5, help="bicep 场景：满激活保持时长（s）")
     args = ap.parse_args()
+    if args.cpp_visc_cg:
+        args.visc_cg = True
+        if not args.cpp_compat:
+            ap.error("--cpp_visc_cg requires --cpp_compat")
+    if args.visc_cg and args.scene not in ("icecream", "hotcut"):
+        ap.error("--visc_cg currently supports the fluid-only viscosity of icecream/hotcut")
 
     ti.init(arch=getattr(ti, args.arch), default_fp=ti.f32, random_seed=0)
     sc = SCENES[args.scene](args)
+    if args.cpp_compat and args.scene in ("ramp", "icecream", "hotcut"):
+        sc.setdefault("solver_kw", {}).update(particle_mass=0.8 * 1000.0 * 0.05**3,
+                                              rest_density=1000.0, cpp_offset=sc["cpp_offset"])
     omega_s = args.omega_s or sc.get("omega_s", 0.5)
     if args.cpp_compat and sc.get("heat", False):
         sc.setdefault("solver_kw", {})["v_clamp"] = 4.0
@@ -1312,10 +1629,15 @@ def main():
     solver = ConstraintSolver(
         sc["pos"], sc["body"], sc["mats"], sc["d"], sc["domain"], sc["dt"],
         gravity=sc.get("gravity", (0.0, -9.81, 0.0)), iters=args.iters, div_iters=args.div_iters, omega_s=omega_s,
+        omega=args.omega_rho or (0.5 if args.cpp_compat else 1.0),
+        visc_cg=args.visc_cg,
+        cpp_visc_cg=args.cpp_visc_cg,
         use_div=not args.no_div, cpp_compat=args.cpp_compat,
         **{**dict(heat_y=0.03 if heat else -1.0, heat_R=30.0 if heat else 0.0, diffusion=100.0 if heat else 0.0),
            **sc.get("solver_kw", {})},
     )
+    solver.compute_density(solver.x)
+    solver.compute_strain_rate_and_mu()
     # 加热场景：只加热左块（body 0），右块每步温度清零作为对照
     tag = args.scene + ("_musweep" if args.mu_sweep else "") + ("_nodiv" if args.no_div else "")
     if args.scene == "ramp":
@@ -1361,14 +1683,19 @@ def main():
         ep, eo = solver.step()
         x = solver.x.to_numpy()[:solver.nf]
         if not np.isfinite(x).all():
-            print(f"NaN at step {s}")
-            break
+            if usd is not None:
+                usd.close()
+            raise FloatingPointError(f"Non-finite positions at step {s}")
         if s % 50 == 0 or s == sc["steps"] - 1:
             vmax = float(np.linalg.norm(solver.v.to_numpy()[:solver.nf], axis=1).max())
             st = body_stats(x, body, nb)
             rec = dict(step=s, t=round((s + 1) * sc["dt"], 4), err_pred_avg=float(ep[0]), err_pred_max=float(ep[1]),
                        err_post_avg=float(eo[0]), err_post_max=float(eo[1]), vmax=vmax,
                        heights=[round(b["height"], 4) for b in st])
+            nd = solver.neighbor_diagnostics()
+            rec.update(cell_overflow=int(nd[0]), neighbor_cap=int(nd[1]), outside_grid=int(nd[2]))
+            if args.visc_cg:
+                rec.update(visc_cg_iters=solver.cg_iterations, visc_cg_error=solver.cg_error)
             rec["com_" + "xyz"[axis]] = [round(b["com"][axis], 4) for b in st]
             if "activation" in sc:
                 rec["activation"] = round(float(solver.activation[None]), 3)
@@ -1397,6 +1724,13 @@ def main():
         snapshot(x, body, f"{args.out}/{tag}_final_top.png", f"{tag} final (top view, x=downslope)", (2, 0))
     summary = dict(scene=tag, particles=solver.nf, steps=sc["steps"], seconds=round(el, 1),
                    ms_per_step=round(1000 * el / max(1, sc["steps"]), 1), names=sc.get("names"), bodies=st, log=log)
+    summary["parameters"] = dict(dt=sc["dt"], iters=args.iters, div_iters=args.div_iters,
+                                 omega_rho=solver.omega, omega_s=omega_s, visc_cg=args.visc_cg,
+                                 cpp_visc_cg=args.cpp_visc_cg,
+                                 mass=solver.mass, rho0=solver.rho0, h=solver.h,
+                                 viscosity_force_scale=solver.viscosity_force_scale,
+                                 position_precision="f64" if args.cpp_compat else "f32",
+                                 unbounded_hash=args.cpp_compat, max_neighbors=solver.max_nb)
     with open(f"{args.out}/{tag}.json", "w") as f:
         json.dump(summary, f, ensure_ascii=False, indent=1)
     print(f"[{tag}] done in {el:.1f}s ({summary['ms_per_step']} ms/step)")

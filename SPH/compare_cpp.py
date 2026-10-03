@@ -16,7 +16,7 @@ from bgeo_io import read_bhclassic
 
 
 def cpp_frames(cpp_dir, ids):
-    """读取 <cpp_dir>/ParticleData_<id>_<frame>.bgeo.gz，返回 {frame: (pos, attrs, body)}，多个 fluid id 拼接为多个 body。"""
+    """Stream (frame, (position, attributes, body)) for the shared C++ frames."""
     per_id = []
     for fid in ids:
         files = glob.glob(os.path.join(cpp_dir, f"ParticleData_{fid}_*.bgeo.gz"))
@@ -24,7 +24,6 @@ def cpp_frames(cpp_dir, ids):
             raise FileNotFoundError(f"{cpp_dir} 下没有 ParticleData_{fid}_*.bgeo.gz")
         per_id.append({int(re.search(r"_(\d+)\.bgeo\.gz$", f).group(1)): f for f in files})
     common = sorted(set.intersection(*[set(d) for d in per_id]))
-    out = {}
     for fr in common:
         pos, attrs, body = [], {}, []
         for b, d in enumerate(per_id):
@@ -34,8 +33,7 @@ def cpp_frames(cpp_dir, ids):
             for k, v in a.items():
                 if k != "position":
                     attrs.setdefault(k, []).append(np.asarray(v))
-        out[fr] = (np.concatenate(pos), {k: np.concatenate(v) for k, v in attrs.items()}, np.concatenate(body))
-    return out
+        yield fr, (np.concatenate(pos), {k: np.concatenate(v) for k, v in attrs.items()}, np.concatenate(body))
 
 
 def taichi_frames(usd_path):
@@ -43,19 +41,28 @@ def taichi_frames(usd_path):
 
     st = Usd.Stage.Open(usd_path)
     prim = st.GetPrimAtPath("/World/particles")
+    if not prim:
+        raise ValueError(f"{usd_path}: missing /World/particles; wait for the simulation to finish")
     pts = UsdGeom.Points(prim)
     pv = UsdGeom.PrimvarsAPI(prim)
     body = np.array(pv.GetPrimvar("body").Get(), np.int32)
     names = {"mu": "mu", "T": "T", "strainRateNorm": "strainRateNorm"}
-    out = {}
-    for fr in range(int(st.GetStartTimeCode()), int(st.GetEndTimeCode()) + 1):
+    class Frames:
+        stage = st  # Keep the owning stage alive while reading lazy frames.
+        def __contains__(self, fr):
+            return fr in pts.GetPointsAttr().GetTimeSamples()
+
+        def __getitem__(self, fr):
+            return read_frame(fr)
+
+    def read_frame(fr):
         attrs = {"velocity": np.array(pts.GetVelocitiesAttr().Get(fr))}
         for k, n in names.items():
             p = pv.GetPrimvar(n)
             if p and p.Get(fr) is not None:
                 attrs[k] = np.array(p.Get(fr))
-        out[fr] = (np.array(pts.GetPointsAttr().Get(fr)), attrs, body)
-    return out, st.GetTimeCodesPerSecond()
+        return np.array(pts.GetPointsAttr().Get(fr)), attrs, body
+    return Frames(), st.GetTimeCodesPerSecond()
 
 
 # C++ 属性名 -> 统一名。C++ 的 nonNewtonViscosity 为运动黏度，Taichi 的 mu 为动力黏度（= 运动黏度 * 1000）
@@ -69,9 +76,11 @@ def stats(pos, attrs, body, nb, src):
         if not m.any():
             rows.append(None)
             continue
-        p = pos[m]
+        p = np.asarray(pos[m], np.float64)
         r = dict(com_x=p[:, 0].mean(), com_y=p[:, 1].mean(), com_z=p[:, 2].mean(), y_max=p[:, 1].max(),
-                 x_min=p[:, 0].min(), x_max=p[:, 0].max(), z_min=p[:, 2].min(), z_max=p[:, 2].max())
+                 x_min=p[:, 0].min(), x_max=p[:, 0].max(), y_min=p[:, 1].min(), z_min=p[:, 2].min(), z_max=p[:, 2].max())
+        if not np.isfinite(p).all():
+            raise ValueError(f"{src} body {b}: non-finite positions")
         a = {CPP_ALIAS.get(k, k): v for k, v in attrs.items()} if src == "cpp" else dict(attrs)
         if src == "taichi" and "mu" in a:
             a["nu"] = a.pop("mu") / 1000.0
@@ -79,7 +88,9 @@ def stats(pos, attrs, body, nb, src):
             r["v_mean"] = np.linalg.norm(a["velocity"][m], axis=1).mean()
         for k in ("nu", "T", "strainRateNorm"):
             if k in a:
-                r[k + "_mean"] = float(np.mean(a[k][m]))
+                values = a[k][m]
+                r[k + "_mean"] = float(np.mean(values, dtype=np.float64))
+                r[k + "_finite_fraction"] = float(np.isfinite(values).mean())
         rows.append(r)
     return rows
 
@@ -91,6 +102,7 @@ def main():
     ap.add_argument("--taichi_usd", required=True)
     ap.add_argument("--fps", type=float, default=25.0, help="C++ dataExportFPS（默认 25）")
     ap.add_argument("--out", required=True)
+    ap.add_argument("--times", help="C++ diagnostic frame_times.csv; defaults to <cpp_dir>/frame_times.csv")
     args = ap.parse_args()
     ids = args.ids.split(",")
     os.makedirs(args.out, exist_ok=True)
@@ -100,8 +112,13 @@ def main():
     nb = len(ids)
     # C++：第 k 次导出（k 从 1 起）发生在 t = (k-1)/fps；Taichi：第 f 帧在 t = f/tai_fps
     rows = []
-    for k, (pos, attrs, body) in cpp.items():
-        t = (k - 1) / args.fps
+    times_path = args.times or os.path.join(args.cpp_dir, "frame_times.csv")
+    times = {}
+    if os.path.exists(times_path):
+        with open(times_path, newline="") as tf:
+            times = {int(r["frame"]): float(r["time"]) for r in csv.DictReader(tf)}
+    for k, (pos, attrs, body) in cpp:
+        t = times.get(k, (k - 1) / args.fps)
         f = int(round(t * tai_fps))
         if f not in tai:
             continue
@@ -111,7 +128,8 @@ def main():
         for b in range(nb):
             if sc[b] is None or st[b] is None:
                 continue
-            row = dict(t=round(t, 4), body=ids[b], n_cpp=int((body == b).sum()), n_taichi=int((tb == b).sum()))
+            row = dict(t=round(t, 7), t_taichi=f / tai_fps, time_error=t - f / tai_fps,
+                       body=ids[b], n_cpp=int((body == b).sum()), n_taichi=int((tb == b).sum()))
             for key in sc[b]:
                 if key in st[b]:
                     row[key + "_cpp"] = sc[b][key]

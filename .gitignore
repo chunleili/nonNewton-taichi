@@ -5,3 +5,5 @@
 results/*
 .DS_Store
 SPH/output/
+.venv*/
+SPH/*.log

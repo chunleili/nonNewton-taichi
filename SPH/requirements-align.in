@@ -1,0 +1,4 @@
+taichi==1.7.2
+numpy==1.26.4
+usd-core==26.3
+matplotlib

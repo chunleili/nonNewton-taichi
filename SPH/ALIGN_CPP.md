@@ -1,5 +1,11 @@
 # Taichi 版与 nonNewtonCode（C++）数值对齐：交接说明
 
+> 2026-10-03 Windows 验证更新：远程实际含求解器和本文的分支是 `v2`，不是下表历史记载的 `main`。
+> 当前可复现入口为 `python run_alignment.py`，依赖见 `requirements-align.in`。
+> 热场景兼容模式须先运行 C++，随后读取同一份 `data/MyScenes/Cache` 边界采样；也可用 `--cpp_boundary_cache` 指定。
+> 已核实的质量、边界黏度、热源、C++ Casson 预条件器错误及最终逐帧结果，见 `align_results/REPORT.md`。
+> 第 5 节保留交接时的问题清单；已修复项与被源码/实验否定的旧推断，以报告为准。
+
 给在 Windows 机器上接手的 agent。目标：在 Windows 上跑 C++ 原版，导出逐帧粒子数据，与本仓库 Taichi 版
 （`SPH/constraint_solver.py`）逐帧比较，定位并缩小差异。
 
