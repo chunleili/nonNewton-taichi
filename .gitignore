@@ -3,3 +3,5 @@
 *.ini
 *.profile
 results/*
+.DS_Store
+SPH/output/
