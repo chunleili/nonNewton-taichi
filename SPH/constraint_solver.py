@@ -93,6 +93,9 @@ class ConstraintSolver:
         viscosity_force_scale=1.0,
         visc_cg=False,
         cpp_visc_cg=False,
+        cpp_visc_boundary=0.1,
+        cpp_dfsph=False,
+        cpp_visc_max_iters=1000,
     ):
         self.d = spacing
         self.h = 2.0 * spacing  # 支撑半径 = 4 倍粒子半径
@@ -114,6 +117,9 @@ class ConstraintSolver:
         self.viscosity_force_scale = viscosity_force_scale
         self.visc_cg = visc_cg
         self.cpp_visc_cg = cpp_visc_cg
+        self.cpp_visc_boundary = cpp_visc_boundary
+        self.cpp_dfsph = cpp_dfsph
+        self.cpp_visc_max_iters = cpp_visc_max_iters
         self.diffusion = diffusion
         self.mu_scale = mu_scale  # 黏度模型输出乘子；nonNewtonCode 的黏度为运动黏度，取 rho0 换算为动力黏度
         self.cpp_compat = cpp_compat  # True：复刻 nonNewtonCode 的应变率（仅末邻居）、Carreau 写法、不截断黏度
@@ -213,6 +219,12 @@ class ConstraintSolver:
         self.cg_scale = ti.field(ti.f32, n)
         self.cg_Minv = ti.Matrix.field(3, 3, ti.f32, n)
         self.cg_state = ti.field(ti.f64, 8)
+        self.cg_vdiff = ti.Vector.field(3, ti.f32, n)
+        self.df_factor = ti.field(ti.f32, n)
+        self.df_adv = ti.field(ti.f32, n)
+        self.df_kappa = ti.field(ti.f32, n)
+        self.df_kappa_v = ti.field(ti.f32, n)
+        self.df_stat = ti.field(ti.f32, 2)
 
         position_dtype = np.float64 if cpp_compat else np.float32
         self.x.from_numpy(pos.astype(position_dtype))
@@ -559,6 +571,117 @@ class ConstraintSolver:
         for i in range(self.nf):
             self.v[i] += self.omega * self.dx[i]
 
+    # ---- C++ reference pressure splitting (thermal Akinci scenes only)
+    @ti.kernel
+    def dfsph_factor(self):
+        for i in range(self.nf):
+            denom = self.mass * self.density_diag(i, self.x)
+            self.df_factor[i] = 0.0
+            if denom > 1e-5:
+                self.df_factor[i] = -1.0 / denom
+
+    @ti.kernel
+    def dfsph_rhs(self, pressure: ti.template()):
+        self.df_stat[0] = 0.0
+        self.df_stat[1] = 0.0
+        for i in range(self.nf):
+            delta = 0.0
+            for jj in range(self.nb_cnt[i]):
+                j = self.nb[i, jj]
+                delta += self.pmass[j] / self.rho0 * (self.v[i] - self.v[j]).dot(self.gradW(self.x[i] - self.x[j]))
+            error = ti.max(delta, 0.0)
+            if ti.static(pressure):
+                error = ti.max(self.rho[i] / self.rho0 + self.dt * delta - 1.0, 0.0)
+            elif self.nb_cnt[i] < 20:
+                error = 0.0
+            self.df_adv[i] = error
+            self.df_stat[0] += error / self.nf
+            ti.atomic_max(self.df_stat[1], error)
+
+    @ti.kernel
+    def dfsph_warmstart(self, pressure: ti.template()):
+        for i in range(self.nf):
+            value = 0.0
+            if self.df_adv[i] > 0:
+                if ti.static(pressure):
+                    value = 0.5 * ti.max(self.df_kappa[i], -0.00025) / self.dt**2
+                else:
+                    value = 0.5 * ti.max(self.df_kappa_v[i], -0.5) / self.dt
+            self.dlam[i] = value
+            # C++ retains the warmstarted multiplier when accumulating ki.
+            if ti.static(pressure):
+                self.df_kappa[i] = value
+            else:
+                self.df_kappa_v[i] = value
+
+    @ti.kernel
+    def dfsph_multiplier(self, pressure: ti.template()):
+        for i in range(self.nf):
+            factor = self.df_factor[i] / self.dt
+            if ti.static(pressure):
+                factor /= self.dt
+            ki = self.df_adv[i] * factor
+            self.dlam[i] = ki
+            if ti.static(pressure):
+                self.df_kappa[i] += ki
+            else:
+                self.df_kappa_v[i] += ki
+
+    @ti.kernel
+    def dfsph_apply(self):
+        for i in range(self.nf):
+            dv = ti.Vector([0.0, 0.0, 0.0])
+            ki = self.dlam[i]
+            for jj in range(self.nb_cnt[i]):
+                j = self.nb[i, jj]
+                ks = ki
+                if j < self.nf:
+                    ks += self.dlam[j]
+                if j < self.nf or ti.abs(ki) > 1e-5:
+                    dv += self.dt * ks * self.pmass[j] / self.rho0 * self.gradW(self.x[i] - self.x[j])
+            self.dx[i] = dv
+        for i in range(self.nf):
+            self.v[i] += self.dx[i]
+
+    @ti.kernel
+    def dfsph_finish(self, pressure: ti.template()):
+        for i in range(self.nf):
+            if ti.static(pressure):
+                self.df_kappa[i] *= self.dt**2
+            else:
+                self.df_kappa_v[i] *= self.dt
+
+    def solve_dfsph(self, pressure):
+        self.dfsph_rhs(pressure)
+        self.dfsph_warmstart(pressure)
+        self.dfsph_apply()
+        self.dfsph_rhs(pressure)
+        minimum = 2 if pressure else 1
+        tolerance = 0.0005 if pressure else 0.001 / self.dt
+        for iteration in range(100):
+            self.dfsph_multiplier(pressure)
+            self.dfsph_apply()
+            self.dfsph_rhs(pressure)
+            error = float(self.df_stat[0])
+            if iteration + 1 >= minimum and error <= tolerance:
+                break
+        self.dfsph_finish(pressure)
+        if pressure:
+            self.df_pressure_iters = iteration + 1
+        else:
+            self.df_div_iters = iteration + 1
+
+    @ti.kernel
+    def dfsph_external_velocity(self):
+        for i in range(self.nf):
+            self.v[i] += self.dt * (self.gravity + self.fext[i])
+
+    @ti.kernel
+    def dfsph_advect(self):
+        for i in range(self.nf):
+            self.x_old[i] = self.x[i]
+            self.x[i] += self.dt * self.v[i]
+
     # ---- 黏性约束
     @ti.kernel
     def viscosity_operator(self, src: ti.template(), out: ti.template()):
@@ -593,6 +716,11 @@ class ConstraintSolver:
                     muj = self.cg_scale[j]**2
                     dv = src[i] / self.cg_scale[i] - src[j] / self.cg_scale[j]
                     value -= 10.0 * self.dt * self.mass * muj * self.cg_scale[i] / (self.rho[i] * self.rho[j]) * dv.dot(r) / (r.norm_sqr() + 0.01 * self.h**2) * self.gradW(r)
+                elif j >= self.nf:
+                    # Casson::matrixVecProd retains the static Akinci boundary
+                    # term even though computeRHS/applyForces remove theirs.
+                    r = (self.x[i] - self.x[j]).cast(ti.f32)
+                    value -= 10.0 * self.dt * self.cpp_visc_boundary * self.rho0 * self.pmass[j] / self.rho[i]**2 * src[i].dot(r) / (r.norm_sqr() + 0.01 * self.h**2) * self.gradW(r)
             out[i] = value
 
     @ti.kernel
@@ -603,6 +731,8 @@ class ConstraintSolver:
                 self.cg_scale[i] = ti.sqrt(ti.max(self.mu[i] * self.viscosity_force_scale, 1e-8))
             self.cg_rhs[i] = self.cg_scale[i] * self.v[i]
             self.cg_x[i] = self.cg_rhs[i]
+            if ti.static(self.cpp_dfsph):
+                self.cg_x[i] += self.cg_scale[i] * self.cg_vdiff[i]
             gsum = ti.Vector([0.0, 0.0, 0.0])
             diag = ti.Matrix.zero(ti.f32, 3, 3)
             for jj in range(self.nb_cnt[i]):
@@ -622,6 +752,9 @@ class ConstraintSolver:
                     if j < self.nf and self.body[j] == self.body[i]:
                         r = (self.x[i] - self.x[j]).cast(ti.f32)
                         block -= 10.0 * self.dt * self.mass * ti.max(self.mu[j] * self.viscosity_force_scale, 1e-8) / (self.rho[i] * self.rho[j]) * self.gradW(r).outer_product(r) / (r.norm_sqr() + 0.01 * self.h**2)
+                    elif j >= self.nf:
+                        r = (self.x[i] - self.x[j]).cast(ti.f32)
+                        block -= 10.0 * self.dt * self.cpp_visc_boundary * self.rho0 * self.pmass[j] / self.rho[i]**2 * self.gradW(r).outer_product(r) / (r.norm_sqr() + 0.01 * self.h**2)
                 self.cg_Minv[i] = block.inverse()
 
     @ti.kernel
@@ -658,7 +791,9 @@ class ConstraintSolver:
     @ti.kernel
     def viscosity_cg_finish(self):
         for i in range(self.nf):
-            self.v[i] = self.cg_x[i] / self.cg_scale[i]
+            new_v = self.cg_x[i] / self.cg_scale[i]
+            self.cg_vdiff[i] = new_v - self.v[i]
+            self.v[i] = new_v
 
     @ti.kernel
     def cg_prepare_batch(self):
@@ -697,7 +832,7 @@ class ConstraintSolver:
 
     def solve_viscosity_cg(self, tol=None, max_iters=None):
         tol = tol if tol is not None else (1e-2 if self.cpp_visc_cg else 1e-3)
-        max_iters = max_iters if max_iters is not None else (1000 if self.cpp_visc_cg else 300)
+        max_iters = max_iters if max_iters is not None else (self.cpp_visc_max_iters if self.cpp_visc_cg else 300)
         self.viscosity_cg_init()
         operator = self.cpp_viscosity_operator if self.cpp_visc_cg else self.viscosity_operator
         operator(self.cg_x, self.cg_Ap)
@@ -1007,6 +1142,8 @@ class ConstraintSolver:
 
     # ------------------------------------------------------------------ main step
     def step(self):
+        if self.cpp_dfsph:
+            return self.step_cpp_dfsph()
         # 1. 步初：邻域、应变率、黏度（柔度）
         self.build_grid(self.x)
         self.find_neighbors(self.x)
@@ -1057,6 +1194,30 @@ class ConstraintSolver:
             self.diffuse()
             if self.cpp_compat:
                 self.thermal_compat_state()
+        return err_pred, err_post
+
+    def step_cpp_dfsph(self):
+        # Match TimeStepDFSPH::step: divergence -> thermal/friction ->
+        # implicit viscosity -> gravity -> linearized pressure -> advection.
+        # All forces and pressure gradients use the same step-start positions.
+        self.build_grid(self.x)
+        self.find_neighbors(self.x)
+        self.compute_density(self.x)
+        self.dfsph_factor()
+        if self.use_div:
+            self.solve_dfsph(False)
+        if self.has_heat:
+            self.diffuse()
+            self.thermal_compat_state()
+        else:
+            self.compute_strain_rate_and_mu()
+        self.solve_viscosity_cg()
+        self.dfsph_external_velocity()
+        self.dfsph_rhs(True)
+        err_pred = self.df_stat.to_numpy()
+        self.solve_dfsph(True)
+        err_post = self.df_stat.to_numpy()
+        self.dfsph_advect()
         return err_pred, err_post
 
     @ti.kernel
@@ -1586,6 +1747,8 @@ def main():
     ap.add_argument("--omega_rho", type=float, default=0.0, help="Density/divergence relaxation; compatibility default 0.5")
     ap.add_argument("--visc_cg", action="store_true", help="Solve the quadratic viscous strain energy globally by matrix-free CG")
     ap.add_argument("--cpp_visc_cg", action="store_true", help="Use the C++ Casson fluid viscosity discretization and symmetrized CG")
+    ap.add_argument("--cpp_visc_boundary", type=float, default=0.1, help="Casson boundary viscosity (C++ default 0.1); zero disables for ablation")
+    ap.add_argument("--cpp_dfsph", action="store_true", help="Match C++ thermal-scene DFSPH pressure, warmstart, stopping criteria and force order")
     ap.add_argument("--group", default="ramp1", choices=list(RAMP_GROUPS), help="ramp 场景：对应 nonNewtonCode 的 ramp1/2/3.json")
     ap.add_argument("--coarsen", type=int, default=1, help="ramp 场景：粒子点阵粗化倍数，2 即间距 0.1、粒子数 1/8")
     ap.add_argument("--dt", type=float, default=0.0, help="覆盖场景默认时间步")
@@ -1614,6 +1777,8 @@ def main():
         args.visc_cg = True
         if not args.cpp_compat:
             ap.error("--cpp_visc_cg requires --cpp_compat")
+    if args.cpp_dfsph and not (args.cpp_visc_cg and args.scene in ("icecream", "hotcut")):
+        ap.error("--cpp_dfsph requires --cpp_visc_cg and icecream/hotcut")
     if args.visc_cg and args.scene not in ("icecream", "hotcut"):
         ap.error("--visc_cg currently supports the fluid-only viscosity of icecream/hotcut")
 
@@ -1632,6 +1797,9 @@ def main():
         omega=args.omega_rho or (0.5 if args.cpp_compat else 1.0),
         visc_cg=args.visc_cg,
         cpp_visc_cg=args.cpp_visc_cg,
+        cpp_visc_boundary=args.cpp_visc_boundary,
+        cpp_dfsph=args.cpp_dfsph,
+        cpp_visc_max_iters=100 if args.cpp_dfsph and args.scene == "icecream" else 1000,
         use_div=not args.no_div, cpp_compat=args.cpp_compat,
         **{**dict(heat_y=0.03 if heat else -1.0, heat_R=30.0 if heat else 0.0, diffusion=100.0 if heat else 0.0),
            **sc.get("solver_kw", {})},
@@ -1696,6 +1864,8 @@ def main():
             rec.update(cell_overflow=int(nd[0]), neighbor_cap=int(nd[1]), outside_grid=int(nd[2]))
             if args.visc_cg:
                 rec.update(visc_cg_iters=solver.cg_iterations, visc_cg_error=solver.cg_error)
+            if args.cpp_dfsph:
+                rec.update(pressure_iters=solver.df_pressure_iters, divergence_iters=getattr(solver, "df_div_iters", 0))
             rec["com_" + "xyz"[axis]] = [round(b["com"][axis], 4) for b in st]
             if "activation" in sc:
                 rec["activation"] = round(float(solver.activation[None]), 3)
@@ -1727,6 +1897,8 @@ def main():
     summary["parameters"] = dict(dt=sc["dt"], iters=args.iters, div_iters=args.div_iters,
                                  omega_rho=solver.omega, omega_s=omega_s, visc_cg=args.visc_cg,
                                  cpp_visc_cg=args.cpp_visc_cg,
+                                 cpp_visc_boundary=args.cpp_visc_boundary, cpp_dfsph=args.cpp_dfsph,
+                                 cpp_visc_max_iters=solver.cpp_visc_max_iters,
                                  mass=solver.mass, rho0=solver.rho0, h=solver.h,
                                  viscosity_force_scale=solver.viscosity_force_scale,
                                  position_precision="f64" if args.cpp_compat else "f32",

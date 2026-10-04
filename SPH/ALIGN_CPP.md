@@ -5,6 +5,8 @@
 > 热场景兼容模式须先运行 C++，随后读取同一份 `data/MyScenes/Cache` 边界采样；也可用 `--cpp_boundary_cache` 指定。
 > 已核实的质量、边界黏度、热源、C++ Casson 预条件器错误及最终逐帧结果，见 `align_results/REPORT.md`。
 > 第 5 节保留交接时的问题清单；已修复项与被源码/实验否定的旧推断，以报告为准。
+> 2026-10-04 后续量化修复与完整验证见 `align_results/QUANTITATIVE_REPORT.md`；
+> 热场景 runner 现默认补齐 Casson 边界黏性并使用 `--cpp_dfsph`。ramp AVX 与标量实现的差别单列在新报告中。
 
 给在 Windows 机器上接手的 agent。目标：在 Windows 上跑 C++ 原版，导出逐帧粒子数据，与本仓库 Taichi 版
 （`SPH/constraint_solver.py`）逐帧比较，定位并缩小差异。

@@ -111,6 +111,82 @@ class AlignmentTests(unittest.TestCase):
         s.solve_viscosity_cg(tol=1e-6)
         np.testing.assert_allclose(s.v.to_numpy().ravel(), np.linalg.solve(A, rhs.ravel()), atol=3e-5)
 
+    def test_casson_static_boundary_matches_independent_dense_matrix(self):
+        p = np.array([[1, 1, 1], [1.05, 1, 1]])
+        b = np.array([[1, 0.96, 1], [1.05, 0.96, 1]])
+        s = self.solver(p, boundary=b, boundary_akinci=True,
+                        visc_cg=True, cpp_visc_cg=True)
+        mu = np.array([5000, 10000, 0, 0], np.float32)
+        rho = np.array([700, 800, 0, 0], np.float32)
+        s.mu.from_numpy(mu)
+        s.rho.from_numpy(rho)
+        A = np.eye(6)
+        for i in range(2):
+            for j, xj in enumerate(np.concatenate([p, b])):
+                if i == j:
+                    continue
+                r = p[i] - xj
+                rn = np.linalg.norm(r)
+                grad = (s._W_np(rn + 1e-7) - s._W_np(rn - 1e-7)) / 2e-7 * r / rn
+                coeff = (s.mass * mu[j] / (rho[i] * rho[j]) if j < 2 else
+                         0.1 * s.rho0 * s.pmass[j] / rho[i]**2)
+                block = -10 * s.dt * coeff * np.outer(grad, r) / (rn**2 + 0.01*s.h**2)
+                A[3*i:3*i+3, 3*i:3*i+3] += block
+                if j < 2:
+                    A[3*i:3*i+3, 3*j:3*j+3] -= block
+        rhs = np.zeros((4, 3), np.float32)
+        rhs[:2] = [[1, -1, 0], [-1, -1, 1]]
+        s.v.from_numpy(rhs)
+        s.solve_viscosity_cg(tol=1e-6)
+        np.testing.assert_allclose(s.v.to_numpy()[:2].ravel(), np.linalg.solve(A, rhs[:2].ravel()), atol=3e-5)
+        s.cpp_viscosity_operator(s.cg_x, s.cg_Ap)
+        np.testing.assert_allclose(s.cg_Ap.to_numpy()[:2], s.cg_rhs.to_numpy()[:2], atol=0.003)
+
+    def test_dfsph_pressure_iteration_matches_constraint_jacobian(self):
+        p = np.array([[1, 1, 1], [1.05, 1, 1], [1.025, 1.04, 1]])
+        b = np.array([[1.02, 0.97, 1]])
+        s = self.solver(p, boundary=b, boundary_akinci=True,
+                        visc_cg=True, cpp_visc_cg=True, cpp_dfsph=True)
+        v = np.array([[1, -1, 0], [-1, -2, 0], [0, -1, 1], [0, 0, 0]], np.float32)
+        s.v.from_numpy(v)
+        s.rho.from_numpy(np.array([1100, 1050, 1150, 0], np.float32))
+        # Independently build J for C_i=rho_i/rho0-1; boundaries are fixed.
+        J = np.zeros((3, 9))
+        for i in range(3):
+            for j, xj in enumerate(np.concatenate([p, b])):
+                if i == j:
+                    continue
+                r = p[i] - xj
+                rn = np.linalg.norm(r)
+                grad = (s._W_np(rn+1e-7)-s._W_np(rn-1e-7))/2e-7 * r/rn
+                volume = s.pmass[j] / s.rho0
+                J[i, 3*i:3*i+3] += volume * grad
+                if j < 3:
+                    J[i, 3*j:3*j+3] -= volume * grad
+        rhs = np.maximum(np.array([0.1, 0.05, 0.15]) + s.dt * J @ v[:3].ravel(), 0)
+        multipliers = -rhs / np.diag(J @ J.T) / s.dt**2
+        expected = v[:3].ravel() + s.dt * J.T @ multipliers
+        s.dfsph_factor()
+        s.dfsph_rhs(True)
+        np.testing.assert_allclose(s.df_adv.to_numpy()[:3], rhs, rtol=1e-5)
+        s.dfsph_multiplier(True)
+        s.dfsph_apply()
+        np.testing.assert_allclose(s.v.to_numpy()[:3].ravel(), expected, rtol=2e-5, atol=2e-5)
+
+    def test_dfsph_deficient_neighbors_preserve_rigid_freefall(self):
+        p = np.array([[1, 1, 1], [1.05, 1, 1]])
+        s = self.solver(p, visc_cg=True, cpp_visc_cg=True,
+                        cpp_dfsph=True, clip_domain=False)
+        # C++ disables divergence for fewer than 20 total neighbors.
+        s.v.from_numpy(np.array([[1, 0, 0], [-1, 0, 0]], np.float32))
+        s.dfsph_rhs(False)
+        np.testing.assert_array_equal(s.df_adv.to_numpy(), 0)
+        s.v.fill(0)
+        for _ in range(5):
+            s.step()
+        np.testing.assert_allclose(s.x.to_numpy()[:, 1] - p[:, 1], -9.81 * s.dt**2 * 15, atol=1e-9)
+        np.testing.assert_allclose(s.v.to_numpy()[:, 1], -9.81 * s.dt * 5, atol=1e-7)
+
 
 if __name__ == "__main__":
     unittest.main()

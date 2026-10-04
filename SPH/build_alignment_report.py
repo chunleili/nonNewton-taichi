@@ -40,6 +40,9 @@ def main():
     (OUT / "summary.json").write_text(json.dumps(summaries, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8")
     report = """# Windows C++ / Taichi 数值对齐报告
 
+> 本报告是提交 `11dfc47` 的首轮结果。2026-10-04 的修复和新数据见 [QUANTITATIVE_REPORT.md](QUANTITATIVE_REPORT.md)。
+> 以下复现命令须使用旧提交；当前 runner 的热场景分步顺序、输出目录已更新。
+
 2026-10-03。两个仓库位于 `D:/Dev/nonNewton/`。Taichi 从远程 `v2` 的 `346e478` 开始；
 交接说明位于 `SPH/ALIGN_CPP.md`，旧说明中的 `main` 与实际远程分支不一致。
 C++ 从指定基准 `47d6a53e1eb34a0017ffc383d16981aadce65f41` 开始，修改在独立分支 `align-windows`，

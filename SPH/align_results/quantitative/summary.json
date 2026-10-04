@@ -1,0 +1,200 @@
+{
+  "ice-cream": {
+    "frames": 251,
+    "time_cpp": 10.0001812,
+    "time_taichi": 10.0,
+    "max_time_error": 0.004999994337599997,
+    "particles": 6250,
+    "metrics": {
+      "y_max": {
+        "cpp_final": 0.28041142225265503,
+        "taichi_final": 0.2800034284591675,
+        "final_abs_error": 0.00040799379348754883,
+        "final_relative_percent": 0.14549827899661666,
+        "rmse": 0.001208012792979713,
+        "max_abs_error": 0.007094621658325195
+      },
+      "T_mean": {
+        "cpp_final": 33.924284620437625,
+        "taichi_final": 33.82279020202637,
+        "final_abs_error": 0.1014944184112565,
+        "final_relative_percent": 0.29917924444635563,
+        "rmse": 0.051636683561831036,
+        "max_abs_error": 0.1014944184112565
+      },
+      "nu_mean": {
+        "cpp_final": 145.81458961129303,
+        "taichi_final": 146.7562870847618,
+        "final_abs_error": 0.9416974734687642,
+        "final_relative_percent": 0.6458184163732212,
+        "rmse": 1.1357117724135761,
+        "max_abs_error": 1.3449994470215643
+      }
+    },
+    "com_final_distance": 0.00019361311413961917,
+    "com_distance_rmse": 0.0009806264227846795,
+    "baseline": {
+      "frames": 251,
+      "time_cpp": 10.0001812,
+      "time_taichi": 10.0,
+      "max_time_error": 0.004999994337599997,
+      "particles": 6250,
+      "metrics": {
+        "y_max": {
+          "cpp_final": 0.28041142225265503,
+          "taichi_final": 0.25694677233695984,
+          "final_abs_error": 0.02346464991569519,
+          "final_relative_percent": 8.367936558074007,
+          "rmse": 0.060542393109077094,
+          "max_abs_error": 0.09261274337768555
+        },
+        "T_mean": {
+          "cpp_final": 33.924284620437625,
+          "taichi_final": 32.45010274833679,
+          "final_abs_error": 1.4741818721008357,
+          "final_relative_percent": 4.345506142855308,
+          "rmse": 0.6899693154845231,
+          "max_abs_error": 1.4741818721008357
+        },
+        "nu_mean": {
+          "cpp_final": 145.81458961129303,
+          "taichi_final": 155.63262668802184,
+          "final_abs_error": 9.818037076728814,
+          "final_relative_percent": 6.733233692802183,
+          "rmse": 13.436949430441123,
+          "max_abs_error": 20.21946310575248
+        }
+      },
+      "com_final_distance": 0.020339178698309198,
+      "com_distance_rmse": 0.03696745279270658
+    },
+    "solver_parameters": {
+      "dt": 0.005,
+      "iters": 10,
+      "div_iters": 5,
+      "omega_rho": 0.5,
+      "omega_s": 0.2,
+      "visc_cg": true,
+      "cpp_visc_cg": true,
+      "cpp_visc_boundary": 0.1,
+      "cpp_dfsph": true,
+      "cpp_visc_max_iters": 100,
+      "mass": 0.10000000000000002,
+      "rho0": 1000.0,
+      "h": 0.1,
+      "viscosity_force_scale": 1.0,
+      "position_precision": "f64",
+      "unbounded_hash": true,
+      "max_neighbors": 128
+    },
+    "runtime_seconds": 215.0,
+    "sampled_diagnostics": {
+      "cell_overflow": 0,
+      "neighbor_cap": 0,
+      "outside_grid": 0,
+      "pressure_iters": 4,
+      "divergence_iters": 1,
+      "visc_cg_iters": 100,
+      "visc_cg_error": 0.2473154934526962
+    }
+  },
+  "hotcut": {
+    "frames": 501,
+    "time_cpp": 20.0018368,
+    "time_taichi": 20.0,
+    "max_time_error": 0.004999994337599997,
+    "particles": 24872,
+    "metrics": {
+      "y_max": {
+        "cpp_final": 1.1288936138153076,
+        "taichi_final": 1.1271770000457764,
+        "final_abs_error": 0.00171661376953125,
+        "final_relative_percent": 0.152061606915255,
+        "rmse": 0.001738032799082564,
+        "max_abs_error": 0.0026807785034179688
+      },
+      "T_mean": {
+        "cpp_final": 2.0343796402555907,
+        "taichi_final": 2.005209342753497,
+        "final_abs_error": 0.029170297502093767,
+        "final_relative_percent": 1.4338669599755205,
+        "rmse": 0.014077363499559835,
+        "max_abs_error": 0.029170297502093767
+      },
+      "nu_mean": {
+        "cpp_final": 16.602075598446184,
+        "taichi_final": 16.643858210436207,
+        "final_abs_error": 0.041782611990022644,
+        "final_relative_percent": 0.25167101391788116,
+        "rmse": 0.021654411861375338,
+        "max_abs_error": 0.041782611990022644
+      }
+    },
+    "com_final_distance": 0.0008300885227453852,
+    "com_distance_rmse": 0.0013920661788993495,
+    "baseline": {
+      "frames": 501,
+      "time_cpp": 20.0018368,
+      "time_taichi": 20.0,
+      "max_time_error": 0.004999994337599997,
+      "particles": 24872,
+      "metrics": {
+        "y_max": {
+          "cpp_final": 1.1288936138153076,
+          "taichi_final": 0.3212474584579468,
+          "final_abs_error": 0.8076461553573608,
+          "final_relative_percent": 71.54315920237774,
+          "rmse": 1.2218032598143198,
+          "max_abs_error": 1.425845980644226
+        },
+        "T_mean": {
+          "cpp_final": 2.0343796402555907,
+          "taichi_final": 1.5447127196821966,
+          "final_abs_error": 0.4896669205733941,
+          "final_relative_percent": 24.069594036630964,
+          "rmse": 0.283975014003085,
+          "max_abs_error": 0.4896669205733941
+        },
+        "nu_mean": {
+          "cpp_final": 16.602075598446184,
+          "taichi_final": 17.57624589192902,
+          "final_abs_error": 0.9741702934828353,
+          "final_relative_percent": 5.8677620620762,
+          "rmse": 0.5404024264758575,
+          "max_abs_error": 0.9741702934828353
+        }
+      },
+      "com_final_distance": 0.17611520250714374,
+      "com_distance_rmse": 0.21511493211974902
+    },
+    "solver_parameters": {
+      "dt": 0.005,
+      "iters": 10,
+      "div_iters": 5,
+      "omega_rho": 0.5,
+      "omega_s": 0.5,
+      "visc_cg": true,
+      "cpp_visc_cg": true,
+      "cpp_visc_boundary": 0.1,
+      "cpp_dfsph": true,
+      "cpp_visc_max_iters": 1000,
+      "mass": 0.10000000000000002,
+      "rho0": 1000.0,
+      "h": 0.1,
+      "viscosity_force_scale": 20.0,
+      "position_precision": "f64",
+      "unbounded_hash": true,
+      "max_neighbors": 128
+    },
+    "runtime_seconds": 587.8,
+    "sampled_diagnostics": {
+      "cell_overflow": 0,
+      "neighbor_cap": 0,
+      "outside_grid": 0,
+      "pressure_iters": 4,
+      "divergence_iters": 1,
+      "visc_cg_iters": 248,
+      "visc_cg_error": 0.009997289500503957
+    }
+  }
+}

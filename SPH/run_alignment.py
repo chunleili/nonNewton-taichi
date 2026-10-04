@@ -33,9 +33,12 @@ def main():
     ap.add_argument("--threads", type=int, default=12)
     ap.add_argument("--iters", type=int, default=10)
     ap.add_argument("--visc_solver", choices=["auto", "xpbd", "cg", "cpp_cg"], default="auto")
+    ap.add_argument("--pressure_solver", choices=["auto", "xpbd", "cpp_dfsph"], default="auto")
+    ap.add_argument("--output_dir", type=Path, default=HERE / "output/quant/full")
+    ap.add_argument("--result_dir", type=Path, default=HERE / "align_results/quantitative")
     args = ap.parse_args()
     cpp = args.cpp_repo.resolve()
-    out = HERE / "output/align"
+    out = args.output_dir.resolve()
     env = dict(os.environ, OMP_NUM_THREADS=str(args.threads),
                TI_OFFLINE_CACHE_FILE_PATH=str(HERE / "output/ti-cache"))
     for name, (scene, extra, ids, stop, tag) in CASES.items():
@@ -58,6 +61,13 @@ def main():
             if mode == "auto":
                 mode = "cpp_cg" if scene in ("icecream", "hotcut") else "xpbd"
             visc_args = {"xpbd": [], "cg": ["--visc_cg"], "cpp_cg": ["--cpp_visc_cg"]}[mode]
+            pressure = args.pressure_solver
+            if pressure == "auto":
+                pressure = "cpp_dfsph" if mode == "cpp_cg" and scene in ("icecream", "hotcut") else "xpbd"
+            if pressure == "cpp_dfsph":
+                if mode != "cpp_cg" or scene not in ("icecream", "hotcut"):
+                    ap.error("cpp_dfsph requires cpp_cg and a thermal scene")
+                visc_args += ["--cpp_dfsph"]
             run([sys.executable, "-u", HERE / "constraint_solver.py", "--scene", scene, *extra,
                  *visc_args,
                  "--cpp_compat", "--export", "usd", "--fps", "25", "--arch", args.arch,
@@ -66,7 +76,7 @@ def main():
         if args.only in ("all", "compare"):
             run([sys.executable, HERE / "compare_cpp.py", "--cpp_dir",
                  cpp / f"bin/output/align/{name}/mypartio", "--ids", ids,
-                 "--taichi_usd", out / f"{tag}.usdc", "--out", HERE / f"align_results/{name}"],
+                 "--taichi_usd", out / f"{tag}.usdc", "--out", args.result_dir / name],
                 HERE, out / f"compare-{name}.log", env)
 
 
