@@ -69,6 +69,12 @@ CSV 每物体每帧一行，因此 ramp1/2 各 378 行、ramp3 为 252 行。
 
 ## 未解决事项与已询问的问题
 
+> **2026-10-05 更正（Mac 端审查）**：本节"AVX 分支用固定 `m_viscosity`"的判断不成立。
+> `NonNewton_Weiler2018.cpp:20` 有 `#undef USE_AVX`，ramp 实际运行标量分支，矩阵、预条件器、RHS 都用逐粒子黏度。
+> 另外 ramp 是 Bender2019 边界，`viscosityBoundary: 0.1` 不起作用（`:921` 每步覆盖为本粒子黏度）。
+> ramp 已改用 DFSPH + Weiler2018 + C++ 体积图边界完成对齐，结果见 [../ALIGN_CPP.md](../ALIGN_CPP.md) 第 6 节。以下原文保留。
+
+
 C++ ramp 实际启用 AVX。其矩阵使用固定 `m_viscosity` / `m_boundaryViscosity`，标量分支使用逐粒子非牛顿黏度；预条件器/RHS 又使用逐粒子黏度。ramp JSON 只设 `viscosity0`，基础 `viscosity` 默认 0.01。PowerLaw1/Casson 零应变率产生 inf，CG 日志出现 NaN 残差。
 
 已询问用户：修复 C++ 算子与零应变率后建立有限的新基准，还是保留现有行为进行复刻。尚未收到选择；用户最新要求是先整理资料给 Claude 检查。未擅自修改这些 C++ 物理/数值行为，也未重新运行第二轮 ramp。

@@ -82,6 +82,12 @@ Taichi 环境为独立 Python 3.11.17 / Taichi 1.7.2 / NumPy 1.26.4 / usd-core 2
 
 ## ramp 的新基准问题与尚存限制
 
+> **2026-10-05 更正（Mac 端审查）**：本节"AVX 分支用固定 `m_viscosity`"的判断不成立。
+> `NonNewton_Weiler2018.cpp:20` 有 `#undef USE_AVX`，ramp 实际运行标量分支，矩阵、预条件器、RHS 都用逐粒子黏度。
+> 另外 ramp 是 Bender2019 边界，`viscosityBoundary: 0.1` 不起作用（`:921` 每步覆盖为本粒子黏度）。
+> ramp 已改用 DFSPH + Weiler2018 + C++ 体积图边界完成对齐，结果见 [../ALIGN_CPP.md](../ALIGN_CPP.md) 第 6 节。以下原文保留。
+
+
 本轮没有替换三组 ramp 的首轮结果，也没有声称 ramp 已定量通过。
 重新核查实际 MSVC 工程：`USE_AVX` 已开启。`NonNewton_Weiler2018::matrixVecProd` 的 AVX 分支从
 `m_viscosity` 和 `m_boundaryViscosity` 取固定系数，而标量分支从 `m_viscosity_nonNewton[i]` 与

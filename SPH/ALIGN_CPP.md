@@ -7,6 +7,12 @@
 > 第 5 节保留交接时的问题清单；已修复项与被源码/实验否定的旧推断，以报告为准。
 > 2026-10-04 后续量化修复与完整验证见 `align_results/QUANTITATIVE_REPORT.md`；
 > 热场景 runner 现默认补齐 Casson 边界黏性并使用 `--cpp_dfsph`。ramp AVX 与标量实现的差别单列在新报告中。
+> 2026-10-05 Mac 端更新（提交 `0ddc769`，已合并进 `main`）：
+> - 上一条"ramp AVX 用固定黏度"不成立：`NonNewton_Weiler2018.cpp:20` 有 `#undef USE_AVX`，ramp 实际运行标量分支，
+>   矩阵、预条件器、RHS 都用逐粒子非牛顿黏度，C++ ramp 基准内部是一致的。
+> - ramp 现可用 `--cpp_visc_cg --cpp_dfsph --bender_table data/models/cpp/ramp_bender_table.npz`：DFSPH + Weiler2018 隐式黏性 +
+>   C++ Bender2019 体积图边界，`run_alignment.py` 已默认使用。修正后的第 5.1、5.3 节与第 6 节结果见下文。
+> - 分支：`v2` 与 `bicep` 已合并进 `main`，以后统一用 `main`。
 
 给在 Windows 机器上接手的 agent。目标：在 Windows 上跑 C++ 原版，导出逐帧粒子数据，与本仓库 Taichi 版
 （`SPH/constraint_solver.py`）逐帧比较，定位并缩小差异。
@@ -19,7 +25,7 @@
 | C++ 原版 | https://github.com/chunleili/nonNewtonCode ，基准 commit `47d6a53e1eb34a0017ffc383d16981aadce65f41` | 论文 TVCG 2023 的 SPlisHSPlasH fork |
 
 代码通过 GitHub 同步：Mac 端改完 push，Windows 端 `git pull`；Windows 端的改动也请提交到 `main` 并 push，
-提交前先 `git pull --rebase`，因为 Mac 端可能同时在改 `constraint_solver.py`（另有 bicep 肌肉场景在开发中，勿动）。
+提交前先 `git pull --rebase`，因为 Mac 端可能同时在改 `constraint_solver.py`（bicep 肌肉场景代码也在其中，勿动）。
 **仿真输出（`SPH/output/`、C++ 的 `bin/output/`）不要提交**，体积很大；对比结果只提交 `compare.csv`、`compare.png` 与结论。
 
 ## 1. 环境
@@ -106,10 +112,12 @@ python compare_cpp.py --cpp_dir <C++输出>/out/ramp1/mypartio --ids Newtonain,P
 
 ## 5. 已知差异（Mac 端已确认，需要逐项在 C++ 数据上验证或修正）
 
-### 5.1 黏性求解器不同（根本差异，不必改成一样）
-C++ 用 `NonNewton_Weiler2018`（viscosityMethod 13，隐式 CG）或 `Viscosity_Casson`（8）；Taichi 用 XPBD 黏性约束 +
-Jacobi，柔度 α = 1/(2 μ V dt)。μ 很大（冰淇淋 10⁶ Pa·s）时 Taichi 在有限迭代内“不够硬”：
-冰淇淋前 2 s 塌成锥形，论文里保形。这是主要待解决问题，可尝试加 `--iters`、减小 `--dt`、调 `--omega_s`。
+### 5.1 黏性求解器（已解决）
+C++ 用 `NonNewton_Weiler2018`（viscosityMethod 13，ramp）或 `Viscosity_Casson`（8，热场景），都是隐式 CG。
+Taichi 默认的 XPBD 黏性约束在 μ 很大时不够硬。现在两类场景都有 C++ 兼容的隐式求解（`--cpp_visc_cg --cpp_dfsph`）：
+- 热场景：Casson 算子用邻居黏度 μ_j，以 q = √μ·v 对称化。
+- ramp：Weiler2018 标量分支用本粒子黏度 μ_i 乘整行，以 q = v/√μ 对称化；边界黏度每步取 μ_i（`:921`）。
+  容差取 ramp json：`maxError` 0.1%、`viscoMaxError` 1e-3。
 
 ### 5.2 应变率与黏度截断（`--cpp_compat` 已复刻）
 - C++ `NonNewton::calcStrainRate`（`NonNewton.cpp:224-257`）在邻居循环里用 `=` 而不是 `+=`，只保留最后一个邻居；
@@ -119,11 +127,15 @@ Jacobi，柔度 α = 1/(2 μ V dt)。μ 很大（冰淇淋 10⁶ Pa·s）时 Tai
 - 结论：**论文 Fig.14 的排序依赖这个应变率 bug**。不开 `--cpp_compat` 时排序与论文不符。
 
 ### 5.3 边界
-- ramp：`--noslip` 让斜面粒子参与黏性约束（无滑移）。C++ 用 Akinci 边界黏性 `viscosityBoundary: 0.1`
-  （`NonNewton_Weiler2018.cpp:341`），Taichi 不加 `--noslip` 时用同一离散的显式版本，但排序与论文不符，
-  量纲换算未与 C++ 逐项核对 —— **请用 C++ 数据核对**。
-- C++ boundaryHandlingMethod：ramp 是 2（Bender2019 体积图），ice-cream / hotcut 是 0（Akinci 粒子）。Taichi 一律用
-  边界粒子（网格表面按间距 d 撒点，单层）。ramp 的坡底另加了一块水平地面（C++ 由 domain 下边界承接）。
+- **更正**：此前写"C++ ramp 用 Akinci 边界黏性 `viscosityBoundary: 0.1`（`:341`）"是错的。ramp 的
+  `boundaryHandlingMethod` 是 2（Bender2019 体积图），`:341` 所在的 Akinci 分支不执行；而且
+  `NonNewton_Weiler2018::step`（`:921`）每步令边界黏度等于本粒子黏度，json 的 0.1 在 ramp 中不起作用。
+- ramp 现用 `--bender_table`：`data/models/cpp/ramp_bender_table.npz` 是用 Discregrid 桥接器（`cpp_map_bridge/`）
+  从 C++ 的 `Cache/ramp_sb_vm_0.025_s3_1_1_r40_40_40_i0_t0.cdm` 采样的 (y,z) 表，间隔 0.01。ramp.obj 沿 x 拉伸，
+  抽查不同 x 处差异小于 1e-7。密度、DFSPH 因子与压力、Weiler 边界黏性（切向 4 点，每点 0.25 V_j）、
+  进入边界后推回，都照 `TimeStep::computeVolumeAndBoundaryX` 与 `NonNewton_Weiler2018.cpp:396-440` 实现。
+  旧路径（XPBD + `--noslip` 斜面粒子）的无滑移不够强，粒子会从坡底端滑出掉落（y_min 达 −60 ～ −95 m），不要再用于对比。
+- ice-cream / hotcut 的 boundaryHandlingMethod 是 0（Akinci 粒子），Taichi 读 C++ 的边界采样缓存。
 - hotcut：Taichi 删掉了与切割板距离 < 0.75d 的兔子粒子（24872 → 22202），C++ 靠边界压力推开。第 0 帧粒子数会不同。
 
 ### 5.4 质量与静息密度
@@ -144,10 +156,31 @@ C++ 粒子质量按 `particleRadius` 0.025（间距 0.05）算。冰淇淋模型
 C++：`timeStepSize` 0.001（ramp）/ 0.005（ice-cream、hotcut），`cflMethod: 1` 自适应，`cflMaxTimeStepSize` 0.005。
 Taichi：固定步长，ramp 2e-3、ice-cream / hotcut 5e-3。对比时按时间 t 对齐，不按步数。
 
-## 6. Mac 端已有结果（供参考，粒子间距 0.1）
-ramp 8 模型（`--group all`，一次跑 8 只，C++ 是分 3 个 json 跑），`--noslip --cpp_compat --coarsen 2`，t=5 s 时沿坡位移（m）：
-PowerLaw2 7.23 ≫ Cross 1.47 ≈ Carreau 1.44 ≈ Bingham 1.44 ≈ Newtonian 1.44 ≈ HerschelBulkley 1.43 > PowerLaw1 0.92 > Casson 0.69。
-与论文 Fig.14 定性一致（PowerLaw2 摊开最远，Casson / PowerLaw1 保持形状）。
+## 6. ramp 对齐结果（2026-10-05，Mac，原分辨率间距 0.05）
+命令（每组在 M1 CPU 上约 40 分钟；M1 的 Metal 不支持 f64，须用 `--arch cpu`）：
+```
+python constraint_solver.py --scene ramp --group ramp1 --cpp_compat --cpp_visc_cg --cpp_dfsph \
+  --bender_table data/models/cpp/ramp_bender_table.npz --arch cpu --export usd --fps 25 --out output/align
+```
+t=4.96 s 质心沿坡位移（com_z 变化，m），C++ / Taichi（括号内为首轮 XPBD Taichi）：
+
+| 模型 | C++ / Taichi | 首轮 | 全程质心距离 RMSE |
+|---|---|---|---|
+| Newtonian | 0.822 / 0.817 | 1.133 | 0.027 |
+| Cross | 0.817 / 0.852 | 1.177 | 0.030 |
+| Carreau | 0.799 / 0.850 | 1.143 | 0.043 |
+| Bingham | 0.798 / 0.849 | 1.129 | 0.042 |
+| HerschelBulkley | 0.798 / 0.849 | 1.123 | 0.042 |
+| PowerLaw2 | 5.727 / 5.757 | 5.446 | — |
+| PowerLaw1 / Casson | C++ 无有效基准 / 0.329, 0.191 | 0.803, 0.628 | — |
+
+- 五个近牛顿模型的 y_max、y_min、v_mean 曲线与 C++ 基本重合，末帧 y_min 1.54–1.57，不再漏粒子。
+- C++ 的 PowerLaw1 / Casson：应变率为 0 时 `NonNewton.cpp:378`、`:403` 给出 ν=inf，黏性 CG 返回 NaN
+  （日志 `Visco iterations: 0 error: -nan`），末帧全部粒子以 g·dt 匀速竖直下落。这不是物理行为，不能作为对比基准。
+  Taichi 把应变率下限设为 1e-6，所以有有限黏度。
+- 仍有的差异：PowerLaw2 约 3 s 后 Taichi 从坡端掉落的粒子比 C++ 多（末帧 y_min −27.9 / −7.8），末段 v_mean 偏高；
+  平均应变率约为 C++ 的一半（末邻居应变率依赖邻居顺序）。
+- 对比时 C++ 侧用 `align_results/ramp*/compare.csv` 中的 `*_cpp` 列，Taichi 帧按 C++ 真实导出时间线性插值。
 
 ## 7. 交付物（请提交到 `SPH/align_results/`）
 - 每个场景的 `compare.csv`、`compare.png`

@@ -8,9 +8,9 @@ import sys
 
 HERE = Path(__file__).resolve().parent
 CASES = {
-    "ramp1": ("ramp", ["--group", "ramp1", "--noslip"], "Newtonain,PowerLaw1,PowerLaw2", 5, "ramp_ramp1_noslip_cpp"),
-    "ramp2": ("ramp", ["--group", "ramp2", "--noslip"], "Cross,Casson,Carreau", 5, "ramp_ramp2_noslip_cpp"),
-    "ramp3": ("ramp", ["--group", "ramp3", "--noslip"], "Bingham,HerschelBulkley", 5, "ramp_ramp3_noslip_cpp"),
+    "ramp1": ("ramp", ["--group", "ramp1"], "Newtonain,PowerLaw1,PowerLaw2", 5, "ramp_ramp1_dfsph_bender_cpp"),
+    "ramp2": ("ramp", ["--group", "ramp2"], "Cross,Casson,Carreau", 5, "ramp_ramp2_dfsph_bender_cpp"),
+    "ramp3": ("ramp", ["--group", "ramp3"], "Bingham,HerschelBulkley", 5, "ramp_ramp3_dfsph_bender_cpp"),
     "ice-cream": ("icecream", [], "Fluid", 10, "icecream_cpp"),
     "hotcut": ("hotcut", [], "Fluid", 20, "hotcut_cpp"),
 }
@@ -59,15 +59,21 @@ def main():
         if args.only in ("all", "taichi"):
             mode = args.visc_solver
             if mode == "auto":
-                mode = "cpp_cg" if scene in ("icecream", "hotcut") else "xpbd"
+                mode = "cpp_cg"
             visc_args = {"xpbd": [], "cg": ["--visc_cg"], "cpp_cg": ["--cpp_visc_cg"]}[mode]
             pressure = args.pressure_solver
             if pressure == "auto":
-                pressure = "cpp_dfsph" if mode == "cpp_cg" and scene in ("icecream", "hotcut") else "xpbd"
+                pressure = "cpp_dfsph" if mode == "cpp_cg" else "xpbd"
             if pressure == "cpp_dfsph":
-                if mode != "cpp_cg" or scene not in ("icecream", "hotcut"):
-                    ap.error("cpp_dfsph requires cpp_cg and a thermal scene")
+                if mode != "cpp_cg":
+                    ap.error("cpp_dfsph requires cpp_cg")
                 visc_args += ["--cpp_dfsph"]
+                if scene == "ramp":
+                    # C++ ramp 用 Bender2019 体积图边界；表由 C++ .cdm 采样，见 ALIGN_CPP.md 5.3
+                    visc_args += ["--bender_table", HERE / "data/models/cpp/ramp_bender_table.npz"]
+            elif scene == "ramp":
+                visc_args += ["--noslip"]
+            tag = tag if pressure == "cpp_dfsph" or scene != "ramp" else tag.replace("_dfsph_bender", "_noslip")
             run([sys.executable, "-u", HERE / "constraint_solver.py", "--scene", scene, *extra,
                  *visc_args,
                  "--cpp_compat", "--export", "usd", "--fps", "25", "--arch", args.arch,
