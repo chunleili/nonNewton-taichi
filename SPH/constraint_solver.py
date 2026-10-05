@@ -96,6 +96,11 @@ class ConstraintSolver:
         cpp_visc_boundary=0.1,
         cpp_dfsph=False,
         cpp_visc_max_iters=1000,
+        cpp_weiler=False,
+        cpp_visc_tol=0.01,
+        df_max_error=0.0005,
+        df_max_error_v=0.001,
+        bender=None,
     ):
         self.d = spacing
         self.h = 2.0 * spacing  # 支撑半径 = 4 倍粒子半径
@@ -120,6 +125,10 @@ class ConstraintSolver:
         self.cpp_visc_boundary = cpp_visc_boundary
         self.cpp_dfsph = cpp_dfsph
         self.cpp_visc_max_iters = cpp_visc_max_iters
+        self.cpp_weiler = cpp_weiler  # True：黏性算子用 NonNewton_Weiler2018（ramp），否则 Viscosity_Casson（热场景）
+        self.cpp_visc_tol = cpp_visc_tol  # C++ viscoMaxError
+        self.df_max_error = df_max_error  # C++ maxError / 100（密度误差）
+        self.df_max_error_v = df_max_error_v  # C++ maxErrorV / 100（散度误差，乘 1/dt）
         self.diffusion = diffusion
         self.mu_scale = mu_scale  # 黏度模型输出乘子；nonNewtonCode 的黏度为运动黏度，取 rho0 换算为动力黏度
         self.cpp_compat = cpp_compat  # True：复刻 nonNewtonCode 的应变率（仅末邻居）、Carreau 写法、不截断黏度
@@ -225,6 +234,20 @@ class ConstraintSolver:
         self.df_kappa = ti.field(ti.f32, n)
         self.df_kappa_v = ti.field(ti.f32, n)
         self.df_stat = ti.field(ti.f32, 2)
+        # Bender2019 体积图边界（ramp）：每个流体粒子一个虚拟边界点 x_j = x_i - bdx_i，体积 bvol_i
+        self.has_bender = bender is not None
+        self.bdx = ti.Vector.field(3, ti.f32, n)
+        self.bvol = ti.field(ti.f32, n)
+        if self.has_bender:
+            # 体积图沿 x 拉伸，按 (y, z) 二维表双线性插值；y0/z0 为求解器坐标
+            self.bm_y0, self.bm_z0, self.bm_dy = float(bender["y0"]), float(bender["z0"]), float(bender["dy"])
+            shape = bender["phi"].shape
+            self.bm_phi = ti.field(ti.f32, shape)
+            self.bm_vol = ti.field(ti.f32, shape)
+            self.bm_gy = ti.field(ti.f32, shape)
+            self.bm_gz = ti.field(ti.f32, shape)
+            for f, k in ((self.bm_phi, "phi"), (self.bm_vol, "vol"), (self.bm_gy, "gy"), (self.bm_gz, "gz")):
+                f.from_numpy(np.ascontiguousarray(bender[k], np.float32))
 
         position_dtype = np.float64 if cpp_compat else np.float32
         self.x.from_numpy(pos.astype(position_dtype))
@@ -470,6 +493,8 @@ class ConstraintSolver:
             for jj in range(self.nb_cnt[i]):
                 j = self.nb[i, jj]
                 rho += self.pmass[j] * self.W((xs[i] - xs[j]).norm())
+            if ti.static(self.has_bender):
+                rho += self.rho0 * self.bvol[i] * self.W(self.bdx[i].norm())
             self.rho[i] = rho
 
     @ti.kernel
@@ -524,6 +549,8 @@ class ConstraintSolver:
             gi += g
             if j < self.nf:
                 s2 += g.norm_sqr() / self.mass
+        if ti.static(self.has_bender):
+            gi += self.bvol[i] * self.gradW(self.bdx[i])
         return gi.norm_sqr() / self.mass + s2
 
     @ti.kernel
@@ -589,6 +616,8 @@ class ConstraintSolver:
             for jj in range(self.nb_cnt[i]):
                 j = self.nb[i, jj]
                 delta += self.pmass[j] / self.rho0 * (self.v[i] - self.v[j]).dot(self.gradW(self.x[i] - self.x[j]))
+            if ti.static(self.has_bender):
+                delta += self.bvol[i] * self.v[i].dot(self.gradW(self.bdx[i]))
             error = ti.max(delta, 0.0)
             if ti.static(pressure):
                 error = ti.max(self.rho[i] / self.rho0 + self.dt * delta - 1.0, 0.0)
@@ -639,6 +668,9 @@ class ConstraintSolver:
                     ks += self.dlam[j]
                 if j < self.nf or ti.abs(ki) > 1e-5:
                     dv += self.dt * ks * self.pmass[j] / self.rho0 * self.gradW(self.x[i] - self.x[j])
+            if ti.static(self.has_bender):
+                if ti.abs(ki) > 1e-5:
+                    dv += self.dt * ki * self.bvol[i] * self.gradW(self.bdx[i])
             self.dx[i] = dv
         for i in range(self.nf):
             self.v[i] += self.dx[i]
@@ -657,7 +689,7 @@ class ConstraintSolver:
         self.dfsph_apply()
         self.dfsph_rhs(pressure)
         minimum = 2 if pressure else 1
-        tolerance = 0.0005 if pressure else 0.001 / self.dt
+        tolerance = self.df_max_error if pressure else self.df_max_error_v / self.dt
         for iteration in range(100):
             self.dfsph_multiplier(pressure)
             self.dfsph_apply()
@@ -702,25 +734,97 @@ class ConstraintSolver:
                     force -= self.V * ((self.cg_D[i] + self.cg_D[j]) @ self.gradW(self.x[i] - self.x[j]))
             out[i] = src[i] + 2.0 * self.V * self.dt / self.mass * force
 
+    @ti.func
+    def bender_visc_block(self, i, mub):
+        # NonNewton_Weiler2018::matrixVecProd 的 Bender2019 分支：x_j 两侧切向各取 0.5h 的 4 个点，每点体积 0.25 V_j
+        B = ti.Matrix.zero(ti.f32, 3, 3)
+        if self.bvol[i] > 0.0:
+            nrm = -self.bdx[i].normalized()
+            v = ti.Vector([1.0, 0.0, 0.0])
+            if ti.abs(v.dot(nrm)) > 0.999:
+                v = ti.Vector([0.0, 1.0, 0.0])
+            t1 = nrm.cross(v).normalized()
+            t2 = nrm.cross(t1).normalized()
+            dist = 0.5 * self.h
+            for k in ti.static(range(4)):
+                t = t1
+                if ti.static(k >= 2):
+                    t = t2
+                r = self.bdx[i] + (1.0 - 2.0 * (k % 2)) * dist * t  # x_i - x_k，x_k = x_j - sgn * dist * t
+                B += 10.0 * mub * 0.25 * self.bvol[i] * self.gradW(r).outer_product(r) / (r.norm_sqr() + 0.01 * self.h**2)
+        return self.dt / self.rho[i] * B
+
+    @ti.func
+    def bender_lookup(self, y, z):
+        # 返回 (phi, V, dphi/dy, dphi/dz)；表外 phi 为大值
+        res = ti.Vector([1e30, 0.0, 0.0, 0.0])
+        fy = (y - self.bm_y0) / self.bm_dy
+        fz = (z - self.bm_z0) / self.bm_dy
+        ny, nz = ti.static(self.bm_phi.shape)
+        if fy >= 0.0 and fz >= 0.0 and fy < ny - 1 and fz < nz - 1:
+            iy, iz = int(fy), int(fz)
+            a, b = fy - iy, fz - iz
+            w = ti.Vector([(1 - a) * (1 - b), (1 - a) * b, a * (1 - b), a * b])
+            ok = True
+            acc = ti.Vector([0.0, 0.0, 0.0, 0.0])
+            for k in ti.static(range(4)):
+                jy, jz = iy + k // 2, iz + k % 2
+                ph = self.bm_phi[jy, jz]
+                if ph > 1e20:
+                    ok = False
+                acc += w[k] * ti.Vector([ph, self.bm_vol[jy, jz], self.bm_gy[jy, jz], self.bm_gz[jy, jz]])
+            if ok:
+                res = acc
+        return res
+
+    @ti.kernel
+    def bender_update(self):
+        # TimeStep::computeVolumeAndBoundaryX（Bender2019）
+        pr = 0.5 * self.d
+        for i in range(self.nf):
+            self.bvol[i] = 0.0
+            self.bdx[i] = ti.Vector([0.0, 0.0, 0.0])
+            q = self.bender_lookup(ti.cast(self.x[i][1], ti.f32), ti.cast(self.x[i][2], ti.f32))
+            dist = q[0]
+            nrm = ti.Vector([0.0, q[2], q[3]])
+            nl = nrm.norm()
+            if dist > 0.0 and dist < self.h:
+                if q[1] > 0.0 and nl > 1e-9:
+                    self.bvol[i] = q[1]
+                    self.bdx[i] = ti.max(dist + 0.5 * pr, 2.0 * pr) * nrm / nl
+            elif dist <= 0.0 and nl > 1e-5:
+                # 粒子进入边界：沿法向小步推回表面，速度清零
+                delta = ti.min(2.0 * pr - dist, 0.1 * pr)
+                self.x[i] += ti.cast(delta * nrm / nl, self.x.dtype)
+                self.v[i] = ti.Vector([0.0, 0.0, 0.0])
+
     @ti.kernel
     def cpp_viscosity_operator(self, src: ti.template(), out: ti.template()):
         # Casson.cpp uses mu_j, producing a diagonally symmetrizable matrix.
         # q_i=sqrt(mu_i)*v_i makes the reference operator symmetric positive definite.
+        # NonNewton_Weiler2018.cpp（标量分支）用 mu_i 乘整行，相似变换改为 q_i=v_i/sqrt(mu_i)；
+        # 其边界黏度每步取 mu_i（:921），这里以 Akinci 边界粒子近似 Bender2019 体积图。
         for i in range(self.nf):
             value = src[i]
-            mui = self.cg_scale[i]**2
+            mub = self.cpp_visc_boundary * self.rho0
+            if ti.static(self.cpp_weiler):
+                mub = ti.max(self.mu[i], 1e-8)
             for jj in range(self.nb_cnt[i]):
                 j = self.nb[i, jj]
                 if j < self.nf and self.body[j] == self.body[i]:
                     r = (self.x[i] - self.x[j]).cast(ti.f32)
-                    muj = self.cg_scale[j]**2
+                    coef = self.cg_scale[j]**2 * self.cg_scale[i]
+                    if ti.static(self.cpp_weiler):
+                        coef = 1.0 / self.cg_scale[i]
                     dv = src[i] / self.cg_scale[i] - src[j] / self.cg_scale[j]
-                    value -= 10.0 * self.dt * self.mass * muj * self.cg_scale[i] / (self.rho[i] * self.rho[j]) * dv.dot(r) / (r.norm_sqr() + 0.01 * self.h**2) * self.gradW(r)
+                    value -= 10.0 * self.dt * self.mass * coef / (self.rho[i] * self.rho[j]) * dv.dot(r) / (r.norm_sqr() + 0.01 * self.h**2) * self.gradW(r)
                 elif j >= self.nf:
                     # Casson::matrixVecProd retains the static Akinci boundary
                     # term even though computeRHS/applyForces remove theirs.
                     r = (self.x[i] - self.x[j]).cast(ti.f32)
-                    value -= 10.0 * self.dt * self.cpp_visc_boundary * self.rho0 * self.pmass[j] / self.rho[i]**2 * src[i].dot(r) / (r.norm_sqr() + 0.01 * self.h**2) * self.gradW(r)
+                    value -= 10.0 * self.dt * mub * self.pmass[j] / self.rho[i]**2 * src[i].dot(r) / (r.norm_sqr() + 0.01 * self.h**2) * self.gradW(r)
+            if ti.static(self.has_bender):
+                value -= self.bender_visc_block(i, mub) @ src[i]
             out[i] = value
 
     @ti.kernel
@@ -729,6 +833,8 @@ class ConstraintSolver:
             self.cg_scale[i] = 1.0
             if ti.static(self.cpp_visc_cg):
                 self.cg_scale[i] = ti.sqrt(ti.max(self.mu[i] * self.viscosity_force_scale, 1e-8))
+                if ti.static(self.cpp_weiler):
+                    self.cg_scale[i] = 1.0 / self.cg_scale[i]
             self.cg_rhs[i] = self.cg_scale[i] * self.v[i]
             self.cg_x[i] = self.cg_rhs[i]
             if ti.static(self.cpp_dfsph):
@@ -747,14 +853,23 @@ class ConstraintSolver:
             self.cg_Minv[i] = ti.Matrix.identity(ti.f32, 3) / self.cg_diag[i]
             if ti.static(self.cpp_visc_cg):
                 block = ti.Matrix.identity(ti.f32, 3)
+                mui = ti.max(self.mu[i] * self.viscosity_force_scale, 1e-8)
+                mub = self.cpp_visc_boundary * self.rho0
+                if ti.static(self.cpp_weiler):
+                    mub = mui
                 for jj in range(self.nb_cnt[i]):
                     j = self.nb[i, jj]
                     if j < self.nf and self.body[j] == self.body[i]:
                         r = (self.x[i] - self.x[j]).cast(ti.f32)
-                        block -= 10.0 * self.dt * self.mass * ti.max(self.mu[j] * self.viscosity_force_scale, 1e-8) / (self.rho[i] * self.rho[j]) * self.gradW(r).outer_product(r) / (r.norm_sqr() + 0.01 * self.h**2)
+                        mu_c = ti.max(self.mu[j] * self.viscosity_force_scale, 1e-8)
+                        if ti.static(self.cpp_weiler):
+                            mu_c = mui
+                        block -= 10.0 * self.dt * self.mass * mu_c / (self.rho[i] * self.rho[j]) * self.gradW(r).outer_product(r) / (r.norm_sqr() + 0.01 * self.h**2)
                     elif j >= self.nf:
                         r = (self.x[i] - self.x[j]).cast(ti.f32)
-                        block -= 10.0 * self.dt * self.cpp_visc_boundary * self.rho0 * self.pmass[j] / self.rho[i]**2 * self.gradW(r).outer_product(r) / (r.norm_sqr() + 0.01 * self.h**2)
+                        block -= 10.0 * self.dt * mub * self.pmass[j] / self.rho[i]**2 * self.gradW(r).outer_product(r) / (r.norm_sqr() + 0.01 * self.h**2)
+                if ti.static(self.has_bender):
+                    block -= self.bender_visc_block(i, mub)
                 self.cg_Minv[i] = block.inverse()
 
     @ti.kernel
@@ -831,7 +946,7 @@ class ConstraintSolver:
             self.cg_state[5] = 0.0
 
     def solve_viscosity_cg(self, tol=None, max_iters=None):
-        tol = tol if tol is not None else (1e-2 if self.cpp_visc_cg else 1e-3)
+        tol = tol if tol is not None else (self.cpp_visc_tol if self.cpp_visc_cg else 1e-3)
         max_iters = max_iters if max_iters is not None else (self.cpp_visc_max_iters if self.cpp_visc_cg else 300)
         self.viscosity_cg_init()
         operator = self.cpp_viscosity_operator if self.cpp_visc_cg else self.viscosity_operator
@@ -1202,6 +1317,8 @@ class ConstraintSolver:
         # All forces and pressure gradients use the same step-start positions.
         self.build_grid(self.x)
         self.find_neighbors(self.x)
+        if self.has_bender:
+            self.bender_update()
         self.compute_density(self.x)
         self.dfsph_factor()
         if self.use_div:
@@ -1366,7 +1483,9 @@ def scene_ramp(args):
     t1 = np.array([1.0, 0.0, 0.0])
     t2 = np.cross(t1, nrm)  # 沿坡向下（+z, -y）
     s2 = (V - c) @ t2
-    u = np.arange(pos[:, 0].min() - 1.0, pos[:, 0].max() + 1.0, d)
+    # 斜面 x 范围取 ramp.obj 的实际宽度；只铺物体附近时，摊开的粒子会从侧边掉落
+    u = np.arange(V[:, 0].min(), V[:, 0].max() + 0.5 * d, d) if args.cpp_compat else \
+        np.arange(pos[:, 0].min() - 1.0, pos[:, 0].max() + 1.0, d)
     w = np.arange(s2.min(), s2.max() + 0.5 * d, d)
     U, W = np.meshgrid(u, w, indexing="ij")
     plane = c + np.outer(U.ravel(), t1) + np.outer(W.ravel(), t2)
@@ -1390,8 +1509,21 @@ def scene_ramp(args):
     return dict(pos=pos + off, body=body, mats=mats, names=names, d=d, domain=dom.tolist(), dt=dt,
                 steps=args.steps or int(round(5.0 / dt)), axis=2, view=(2, 1),
                 cpp_offset=off, meshes=[("ramp", V, F)],
-                solver_kw=dict(box_walls=False, boundary=bnd + off, clip_domain=not args.cpp_compat, mu_scale=1000.0,
-                               visc_boundary=None if args.noslip else 0.1))
+                solver_kw={**dict(box_walls=False, boundary=bnd + off, clip_domain=not args.cpp_compat, mu_scale=1000.0,
+                                  visc_boundary=0.0 if args.cpp_dfsph else (None if args.noslip else 0.1)),
+                           # --cpp_dfsph：DFSPH + Weiler2018 隐式黏性，容差取 ramp json（maxError 0.1%、viscoMaxError 1e-3）
+                           **(dict(boundary_akinci=True, cpp_weiler=True, cpp_visc_tol=1e-3, df_max_error=1e-3,
+                                   df_max_error_v=1e-3) if args.cpp_dfsph else {}),
+                           **ramp_bender(args, off)})
+
+
+def ramp_bender(args, off):
+    # 改用 C++ 的 Bender2019 体积图边界（make_bender_table 采样的 (y,z) 表），不再用斜面边界粒子
+    if not args.bender_table:
+        return {}
+    t = np.load(args.bender_table)
+    return dict(boundary=np.zeros((0, 3)), bender=dict(y0=float(t["y0"]) + off[1], z0=float(t["z0"]) + off[2],
+                                                      dy=float(t["dy"]), phi=t["phi"], vol=t["vol"], gy=t["gy"], gz=t["gz"]))
 
 
 def sample_mesh(V, F, d):
@@ -1752,6 +1884,7 @@ def main():
     ap.add_argument("--group", default="ramp1", choices=list(RAMP_GROUPS), help="ramp 场景：对应 nonNewtonCode 的 ramp1/2/3.json")
     ap.add_argument("--coarsen", type=int, default=1, help="ramp 场景：粒子点阵粗化倍数，2 即间距 0.1、粒子数 1/8")
     ap.add_argument("--dt", type=float, default=0.0, help="覆盖场景默认时间步")
+    ap.add_argument("--bender_table", default="", help="ramp + --cpp_dfsph：C++ Bender2019 体积图的 (y,z) 采样表 npz")
     ap.add_argument("--noslip", action="store_true", help="ramp 场景：斜面参与黏性约束（无滑移），默认用 C++ 的 Akinci 边界黏性 0.1")
     ap.add_argument("--cpp_compat", action="store_true", help="复刻 nonNewtonCode 的应变率（仅末邻居）与 Carreau 写法，且不截断黏度")
     ap.add_argument("--cpp_boundary_cache", default="", help="C++ data/MyScenes/Cache directory for matching thermal-scene boundary samples")
@@ -1777,10 +1910,12 @@ def main():
         args.visc_cg = True
         if not args.cpp_compat:
             ap.error("--cpp_visc_cg requires --cpp_compat")
-    if args.cpp_dfsph and not (args.cpp_visc_cg and args.scene in ("icecream", "hotcut")):
-        ap.error("--cpp_dfsph requires --cpp_visc_cg and icecream/hotcut")
-    if args.visc_cg and args.scene not in ("icecream", "hotcut"):
-        ap.error("--visc_cg currently supports the fluid-only viscosity of icecream/hotcut")
+    if args.cpp_dfsph and not (args.cpp_visc_cg and args.scene in ("icecream", "hotcut", "ramp")):
+        ap.error("--cpp_dfsph requires --cpp_visc_cg and icecream/hotcut/ramp")
+    if args.visc_cg and args.scene not in ("icecream", "hotcut", "ramp"):
+        ap.error("--visc_cg currently supports the fluid-only viscosity of icecream/hotcut/ramp")
+    if args.visc_cg and args.scene == "ramp" and not args.cpp_dfsph:
+        ap.error("ramp 的 --visc_cg 仅支持 --cpp_dfsph（Weiler2018 兼容）")
 
     ti.init(arch=getattr(ti, args.arch), default_fp=ti.f32, random_seed=0)
     sc = SCENES[args.scene](args)
@@ -1804,12 +1939,15 @@ def main():
         **{**dict(heat_y=0.03 if heat else -1.0, heat_R=30.0 if heat else 0.0, diffusion=100.0 if heat else 0.0),
            **sc.get("solver_kw", {})},
     )
+    if solver.has_bender:
+        solver.bender_update()
     solver.compute_density(solver.x)
     solver.compute_strain_rate_and_mu()
     # 加热场景：只加热左块（body 0），右块每步温度清零作为对照
     tag = args.scene + ("_musweep" if args.mu_sweep else "") + ("_nodiv" if args.no_div else "")
     if args.scene == "ramp":
-        tag += f"_{args.group}" + (f"_c{args.coarsen}" if args.coarsen > 1 else "") + ("_noslip" if args.noslip else "")
+        tag += f"_{args.group}" + (f"_c{args.coarsen}" if args.coarsen > 1 else "") + ("_noslip" if args.noslip else "") + \
+            ("_dfsph" if args.cpp_dfsph else "") + ("_bender" if args.bender_table else "")
     if args.cpp_compat:
         tag += "_cpp"
     axis = sc.get("axis", 0)
