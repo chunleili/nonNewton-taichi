@@ -1745,7 +1745,7 @@ def scene_bicep(args):
         F0 = args.load_F * min(1.0, t / max(args.act_start, 1e-6))
         cl = x[loaded].mean(0)
         F = F0 * axis - k_spring * (cl - c0)
-        state["F"], state["u"] = F, float((cl - c0) @ axis)
+        state["F"], state["u"], state["c"] = F, float((cl - c0) @ axis), cl
         acc = np.zeros((len(x), 3), np.float32)
         acc[loaded] = F / (nl * mass)
         return acc
@@ -1753,10 +1753,19 @@ def scene_bicep(args):
     def monitor():  # 远端载荷点沿主轴的位移（正为向远端伸长）与载荷力沿主轴的分量
         return dict(distal_u=round(state["u"], 5), load_F=round(float(state["F"] @ axis), 4))
 
+    # Robin 弹簧的可视化：弹簧一端连在载荷段质心（随肌肉运动），另一端为固定锚点。
+    # 锚点取在 c0 + (F0/k) 沿主轴处：此时 F = k (anchor - c)，即一根静息长度为 0、锚在 anchor 的弹簧，
+    # 与上面的 F0*axis - k(c - c0) 完全等价。neumann 时 k=0 无弹簧，锚点仅作示意，取 c0 沿主轴 2.5 cm 处
+    anchor = c0 + (args.load_F / k_spring if k_spring > 0 else 0.025) * axis
+
+    def spring_vis():  # 返回求解器坐标下的 (弹簧附着点, 锚点, 当前力沿主轴分量)
+        return state.get("c", c0), anchor, float(state["F"] @ axis)
+
     print(f"[bicep] pinned={int(pinned.sum())} (proximal heads)  loaded={nl} (distal, {args.load}, "
           f"F0={args.load_F} N, k={k_spring} N/m)  axis={axis.round(3).tolist()}")
     return dict(pos=pos, body=body, mats=mats, names=["belly", "tendon"], d=d, domain=domain, dt=1e-3,
-                steps=args.steps or 1500, activation=activation, load=load, monitor=monitor, axis=1,
+                steps=args.steps or 1500, activation=activation, load=load, monitor=monitor, spring_vis=spring_vis, axis=1,
+                omega_s=0.25,  # 0.5 时满激活保持段近端细肌腱抖动（v99 0.26 m/s），0.25 降到 0.09 m/s
                 gravity=(0.0, -args.gravity, 0.0), cpp_offset=shift,
                 primvars=dict(pinned=pinned, loaded=loaded.astype(np.int32)),
                 solver_kw=dict(box_walls=False, pinned=pinned, obj=np.zeros(len(pos), np.int32), rest_kernel_sum=ksum,
@@ -1842,6 +1851,45 @@ class UsdPointsWriter:
         self.mu.Set(Vt.FloatArray.FromNumpy(mu.astype(np.float32)), frame)
         self.T.Set(Vt.FloatArray.FromNumpy(T.astype(np.float32)), frame)
         self.last = frame
+
+    def add_spring(self, frame, a, b, force, radius=0.004, coils=8, turns_r=0.006):
+        """远端 Robin 弹簧：螺旋线（BasisCurves）+ 两端小球（附着点随肌肉运动，锚点固定）。
+        螺旋按力着色（拉力越大越红，10 N 饱和），线宽 1.5 mm；radius 为两端小球半径。"""
+        from pxr import Gf, Sdf, UsdGeom
+
+        Vt = self.Vt
+        if not hasattr(self, "spring"):
+            UsdGeom.Scope.Define(self.stage, "/World/spring")
+            self.spring = UsdGeom.BasisCurves.Define(self.stage, "/World/spring/coil")
+            self.spring.CreateTypeAttr(UsdGeom.Tokens.linear)
+            self.spring.CreateWidthsAttr(Vt.FloatArray([0.0015]))
+            self.spring.SetWidthsInterpolation(UsdGeom.Tokens.constant)
+            self.spring_col = self.spring.CreateDisplayColorPrimvar(UsdGeom.Tokens.constant)
+            self.spring_force = self.spring.GetPrim().CreateAttribute("force", Sdf.ValueTypeNames.Float)
+            self.spring_ends = {}
+            for name, col in (("attach", (0.15, 0.45, 0.95)), ("anchor", (0.2, 0.2, 0.2))):
+                sp = UsdGeom.Sphere.Define(self.stage, f"/World/spring/{name}")
+                sp.CreateRadiusAttr(radius)
+                sp.CreateDisplayColorAttr(Vt.Vec3fArray([Gf.Vec3f(*col)]))
+                self.spring_ends[name] = sp.AddTranslateOp()
+        a, b = np.asarray(a, np.float64), np.asarray(b, np.float64)
+        L = np.linalg.norm(b - a)
+        e = (b - a) / max(L, 1e-9)
+        u = np.cross(e, [0.0, 0.0, 1.0] if abs(e[2]) < 0.9 else [1.0, 0.0, 0.0])
+        u /= np.linalg.norm(u)
+        w = np.cross(e, u)
+        n = coils * 16 + 1
+        t = np.linspace(0.0, 1.0, n)
+        r = turns_r * np.clip(np.minimum(t, 1.0 - t) / 0.08, 0.0, 1.0)  # 两端收成直线段，接到端点小球
+        ph = 2.0 * np.pi * coils * t
+        P = a + np.outer(t * L, e) + np.outer(r * np.cos(ph), u) + np.outer(r * np.sin(ph), w)
+        self.spring.GetPointsAttr().Set(Vt.Vec3fArray.FromNumpy(P.astype(np.float32)), frame)
+        self.spring.GetCurveVertexCountsAttr().Set(Vt.IntArray([n]), frame)
+        c = float(np.clip(force / 10.0, 0.0, 1.0))
+        self.spring_col.Set(Vt.Vec3fArray([Gf.Vec3f(0.3 + 0.7 * c, 0.3 * (1 - c) + 0.1, 0.3 * (1 - c) + 0.1)]), frame)
+        self.spring_force.Set(force, frame)
+        self.spring_ends["attach"].Set(Gf.Vec3d(*a), frame)
+        self.spring_ends["anchor"].Set(Gf.Vec3d(*b), frame)
 
     def close(self):
         self.stage.SetEndTimeCode(self.last)
@@ -1972,6 +2020,9 @@ def main():
         usd.add(frame, xs, vs, mus, Ts, srs)
         if "activation" in sc:
             usd.set_scalar("activation", float(solver.activation[None]), frame)
+        if "spring_vis" in sc:
+            a, b, f = sc["spring_vis"]()
+            usd.add_spring(frame, a - cpp_off, b - cpp_off, f)
 
     if args.export != "none":
         print(f"[{tag}] export={args.export} every {every} steps ({1.0 / (every * sc['dt']):.1f} fps)")
